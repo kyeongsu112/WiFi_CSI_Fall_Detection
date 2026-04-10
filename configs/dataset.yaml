@@ -1,0 +1,13 @@
+dataset:
+  zip_path: ./data/WiFall.zip
+  output_manifest: ./artifacts/processed/wifall_manifest.csv
+  binary_mapping:
+    walk: non_fall
+    jump: non_fall
+    sit: non_fall
+    stand: non_fall
+    fall: fall
+split:
+  target_subject: ID0
+  support_shot_n: 1
+  random_seed: 42

@@ -1,0 +1,11 @@
+{
+  "session_id": "session_2026_04_07_001",
+  "participant_id": "P03",
+  "room_id": "bedroom_a",
+  "layout_version": "layout_v1",
+  "node_setup_version": "setup_triangle_v1",
+  "activity_label": "fall",
+  "fall_direction": "left",
+  "notes": "fixture replay session",
+  "recorded_at": "2026-04-07T21:10:00+09:00"
+}

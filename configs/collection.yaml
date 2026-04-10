@@ -1,0 +1,15 @@
+source_type: live
+replay_input_path: tests/fixtures/mock_session_packets.jsonl
+live_udp_format: esp32_adr018
+# Bind on all interfaces so ESP32 nodes on the same LAN/hotspot can reach the collector.
+udp_host: 0.0.0.0
+# ESP32 ADR-018 firmware currently sends CSI UDP to port 5005.
+udp_port: 5005
+# Use a short bounded session for smoke testing first. Set to null for manual stop.
+live_session_duration_seconds: 30
+expected_nodes:
+  - "1"
+  - "2"
+  - "3"
+session_output_dir: artifacts/raw
+flush_interval_ms: 1000

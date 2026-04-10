@@ -1,0 +1,13 @@
+random_seed: 42
+source_subjects:
+- ID1
+- ID2
+- ID3
+- ID4
+- ID5
+- ID6
+- ID7
+- ID8
+- ID9
+support_shot_n: 1
+target_subject: ID0

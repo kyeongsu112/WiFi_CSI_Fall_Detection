@@ -1,0 +1,34 @@
+# Python environments and caches
+.venv/
+.venv*/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Local tool metadata
+.claude/
+_codex_restore_probe/
+.vscode/
+.idea/
+
+# Local secrets and overrides
+.env
+.env.*
+!.env.example
+*.local
+
+# Large datasets and generated runtime outputs
+data/WiFall.zip
+artifacts/
+*.log
+
+# Device-specific binary output
+nvs_provision.bin

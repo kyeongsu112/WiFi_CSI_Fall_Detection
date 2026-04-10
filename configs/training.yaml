@@ -1,0 +1,13 @@
+labels:
+  - empty
+  - normal_walk
+  - sit_or_stand_transition
+  - lie_down_intentional
+  - fall
+runtime_labels:
+  - non_fall
+  - fall
+split_strategy: participant_wise
+model_type: logistic_regression
+feature_set: baseline_statistical
+random_seed: 42

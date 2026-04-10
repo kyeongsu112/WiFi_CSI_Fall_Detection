@@ -1,0 +1,9 @@
+model_path: artifacts/models/baseline.joblib
+candidate_threshold: 0.75
+post_fall_inactivity_seconds: 6
+motion_floor_threshold: 0.15
+confirm_window_seconds: 8
+cooldown_seconds: 5
+# For smoke testing, 5 seconds is long enough to detect a stopped node
+# without flapping too aggressively on brief Wi-Fi jitter.
+health_timeout_seconds: 5
