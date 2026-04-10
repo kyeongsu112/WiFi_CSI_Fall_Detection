@@ -1,1 +1,1 @@
-"""Application package marker for later MVP phases."""
+"""Application package for the unified CLI and dashboard server."""

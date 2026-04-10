@@ -1,6 +1,9 @@
 window_seconds: 2.0
 stride_seconds: 0.5
 phase_unwrap_enabled: true
+outlier_zscore_threshold: 3.5
+median_filter_kernel_size: 3
+smoothing_window_size: 3
 selected_subcarriers:
   - 0
   - 1

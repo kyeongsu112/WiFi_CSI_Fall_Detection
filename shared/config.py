@@ -37,6 +37,9 @@ class PreprocessingConfig(BaseModel):
     window_seconds: float = Field(default=2.0, gt=0)
     stride_seconds: float = Field(default=0.5, gt=0)
     phase_unwrap_enabled: bool = True
+    outlier_zscore_threshold: float = Field(default=3.5, gt=0)
+    median_filter_kernel_size: int = Field(default=3, ge=1)
+    smoothing_window_size: int = Field(default=3, ge=1)
     selected_subcarriers: List[int] = Field(default_factory=list)
 
 
@@ -84,6 +87,14 @@ class InferenceConfig(BaseModel):
     confirm_n_windows: int = Field(default=3, ge=1)
     cooldown_windows: int = Field(default=10, ge=0)
     step_delay_seconds: float = Field(default=0.05, ge=0.0)
+
+    # --- ESP32 UDP transport (esp32 source_mode only) ---
+    # Host/port the laptop listens on for incoming CSI UDP packets.
+    # Set esp32_udp_host to "0.0.0.0" to accept from any interface (typical for
+    # Wi-Fi hotspot setups), or to a specific NIC IP to restrict to one network.
+    # Override these in a local, untracked config file (e.g. configs/inference.local.yaml).
+    esp32_udp_host: str = "0.0.0.0"
+    esp32_udp_port: int = Field(default=5005, ge=1, le=65535)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,16 +1,17 @@
-"""Tests for the Step 4 CSI source abstraction (inference/live_source.py).
+"""Tests for the Step 5 inference pipeline (inference/live_source.py).
 
 Covers:
   - build_source() factory: correct type returned per mode, error on unknown
   - MockLiveSource: window shape, dtype, source label, stop_event cancellation
   - ReplaySource: class instantiation (integration skipped without WiFall.zip)
-  - Esp32Source: raises NotImplementedError
-  - InferencePipeline: step() returns ReplayEvent with correct structure
+  - Esp32Source: UDP-backed live source can be constructed
+  - InferencePipeline: step() returns ReplayEvent with low-motion confirmation
 """
 from __future__ import annotations
 
+import json
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ from inference.live_source import (
     build_source,
     resolve_source_mode,
 )
+from inference.confirmation import compute_motion_score
 from inference.replay import ReplayConfig, ReplayEvent
 
 
@@ -113,9 +115,9 @@ def test_build_source_mock_live_returns_mock_source() -> None:
     assert isinstance(src, MockLiveSource)
 
 
-def test_build_source_esp32_raises_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        build_source("esp32")
+def test_build_source_esp32_returns_esp32_source() -> None:
+    src = build_source("esp32", config_path="no_such_file.yaml")
+    assert isinstance(src, Esp32Source)
 
 
 def test_build_source_unknown_raises_value_error() -> None:
@@ -227,9 +229,48 @@ def test_replay_source_instantiation() -> None:
 # Esp32Source
 # ---------------------------------------------------------------------------
 
-def test_esp32_source_raises_not_implemented() -> None:
-    with pytest.raises(NotImplementedError, match="Esp32Source"):
-        Esp32Source()
+def test_esp32_source_instantiation() -> None:
+    """Esp32Source can be constructed without binding a socket."""
+    src = Esp32Source(host="127.0.0.1", port=19999)
+    assert isinstance(src, Esp32Source)
+    assert src.host == "127.0.0.1"
+    assert src.port == 19999
+
+
+def test_esp32_source_recovers_from_recv_oserror(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self, *args, **kwargs) -> None:
+            self.calls = 0
+
+        def setsockopt(self, *args, **kwargs) -> None:
+            return None
+
+        def settimeout(self, *args, **kwargs) -> None:
+            return None
+
+        def bind(self, *args, **kwargs) -> None:
+            return None
+
+        def recvfrom(self, _size: int):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("simulated overflow")
+            payload = json.dumps({"amp": [5.0] * 52, "sid": "dev-01"}).encode("utf-8")
+            return payload, ("127.0.0.1", 5005)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("inference.live_source.socket.socket", lambda *args, **kwargs: FakeSocket())
+    stop = threading.Event()
+    source = Esp32Source(host="127.0.0.1", port=5005, window_size=1, socket_timeout=0.01)
+
+    window = next(source.windows(stop))
+    status = source.get_runtime_status()
+
+    assert window.source_file == "esp32://dev-01"
+    assert status["packets_dropped"] >= 1
+    assert status["packets_received"] >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +282,10 @@ def _make_pipeline() -> InferencePipeline:
     cfg = ReplayConfig(
         model_path="artifacts/models/wifall_baseline.pt",
         candidate_threshold=0.50,
+        post_fall_inactivity_seconds=2.0,
+        motion_floor_threshold=0.15,
+        confirm_window_seconds=4.0,
+        cooldown_seconds=5.0,
         confirm_n_windows=3,
         cooldown_windows=10,
         step_delay_seconds=0.0,
@@ -254,12 +299,17 @@ def _make_pipeline() -> InferencePipeline:
     mock_model.return_value.item.return_value = 2.0
     pipeline._model = mock_model
 
-    from inference.replay import SimpleConfirmationEngine
-    pipeline._engine = SimpleConfirmationEngine(
-        threshold=cfg.candidate_threshold,
-        confirm_n=cfg.confirm_n_windows,
-        cooldown_n=cfg.cooldown_windows,
+    from inference.confirmation import ConfirmationConfig, ConfirmationEngine
+    pipeline._engine = ConfirmationEngine(
+        ConfirmationConfig(
+            candidate_threshold=cfg.candidate_threshold,
+            inactivity_seconds=cfg.post_fall_inactivity_seconds,
+            motion_threshold=cfg.motion_floor_threshold,
+            confirm_window_seconds=cfg.confirm_window_seconds,
+            cooldown_seconds=cfg.cooldown_seconds,
+        )
     )
+    pipeline._previous_window = None
     return pipeline
 
 
@@ -296,19 +346,30 @@ def test_inference_pipeline_low_logit_labels_non_fall() -> None:
 
 
 def test_inference_pipeline_state_machine_transitions() -> None:
-    """Three consecutive high-prob windows should produce confirmed state."""
+    """A candidate followed by sustained low motion should confirm."""
     pipeline = _make_pipeline()  # model returns logit=2.0 (above threshold)
     window = CsiWindow(data=np.zeros((52, 100), dtype=np.float32))
 
     states = [pipeline.step(window, i).alert_state for i in range(4)]
-    # step 0: idle → candidate
-    # step 1: candidate (consecutive=2)
-    # step 2: confirmed (consecutive=3 >= confirm_n=3)
-    # step 3: confirmed → cooldown (auto-transition)
     assert states[0] == "candidate"
     assert states[1] == "candidate"
     assert states[2] == "confirmed"
     assert states[3] == "cooldown"
+
+
+def test_inference_pipeline_confirms_after_fall_score_drops_if_motion_stays_low() -> None:
+    pipeline = _make_pipeline()
+    pipeline._model.return_value.item.side_effect = [2.0, -5.0, -5.0]
+    window = CsiWindow(data=np.zeros((52, 100), dtype=np.float32))
+
+    states = [pipeline.step(window, i).alert_state for i in range(3)]
+
+    assert states == ["candidate", "candidate", "confirmed"]
+
+
+def test_compute_motion_score_returns_high_value_without_previous_window() -> None:
+    current = np.zeros((52, 100), dtype=np.float32)
+    assert compute_motion_score(current, None) == pytest.approx(1.0)
 
 
 def test_inference_pipeline_event_dict_has_all_fields() -> None:

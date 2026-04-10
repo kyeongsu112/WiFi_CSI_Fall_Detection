@@ -8,7 +8,6 @@ model/manifest/zip I/O.
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import patch
 
 import pytest
@@ -29,6 +28,8 @@ def _make_event(
     alert_state: str = "idle",
     probability: float = 0.001,
     predicted_label: str = "non_fall",
+    motion_score: float | None = None,
+    source_status: dict | None = None,
 ) -> ReplayEvent:
     return ReplayEvent(
         step=step,
@@ -37,6 +38,8 @@ def _make_event(
         probability=probability,
         predicted_label=predicted_label,
         alert_state=alert_state,
+        motion_score=motion_score,
+        source_status=source_status,
     )
 
 
@@ -109,6 +112,31 @@ def test_stream_data_event_fields_complete() -> None:
     for field in ("step", "source_file", "window_index", "probability",
                   "predicted_label", "alert_state"):
         assert field in payload, f"missing field: {field}"
+
+
+def test_stream_serializes_source_status_and_motion_score() -> None:
+    event = _make_event(
+        step=3,
+        alert_state="candidate",
+        probability=0.88,
+        motion_score=0.04,
+        source_status={
+            "mode": "esp32",
+            "transport_state": "streaming",
+            "active_sid": "dev-01",
+            "packets_received": 120,
+            "packets_dropped": 2,
+            "windows_emitted": 1,
+        },
+    )
+    with patch("app.server.generate_events", _fake_generate(event)):
+        lines = _collect_sse_lines()
+
+    data_lines = [l for l in lines if l.startswith("data:") and l != "data: {}"]
+    payload = json.loads(data_lines[0].removeprefix("data: "))
+    assert payload["motion_score"] == pytest.approx(0.04)
+    assert payload["source_status"]["transport_state"] == "streaming"
+    assert payload["source_status"]["active_sid"] == "dev-01"
 
 
 def test_stream_emits_done_event_when_replay_ends() -> None:

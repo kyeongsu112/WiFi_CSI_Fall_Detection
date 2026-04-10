@@ -53,9 +53,11 @@ wifi-fall-detection/
     events.py
   app/
     __init__.py
+    __main__.py
     cli.py
-    api.py
-    dashboard.py
+    server.py
+    templates/
+      index.html
   tests/
     fixtures/
     test_packet_parser.py
@@ -69,10 +71,12 @@ wifi-fall-detection/
     events/
   scripts/
     collect.py
+    prepare_wifall.py
     preprocess.py
-    train.py
-    infer.py
-```
+    train_baseline.py
+    eval_baseline.py
+    replay_dashboard.py
+``` 
 
 ---
 
@@ -99,6 +103,35 @@ ESP32 nodes
 6. **predictor** 가 모델 추론을 수행한다.
 7. **confirmation engine** 이 candidate fall을 confirmed fall로 승격할지 결정한다.
 8. 결과는 **event log** 와 **UI** 로 전달된다.
+
+---
+
+## 3.1 ESP32 live 포맷 관계
+
+현재 저장소에는 ESP32 관련 wire format이 두 가지 공존한다.
+
+### collector live 수집용
+- 위치: `collector/receiver.py`
+- 포맷: `esp32_adr018` binary UDP
+- 목적: raw CSI 수집과 세션 저장
+- 출력: `CsiPacket.raw_payload.csi_raw.iq_bytes_hex`
+
+### inference live 대시보드용
+- 위치: `inference/live_source.py`
+- 포맷: JSON v1 UDP
+- 목적: 빠른 실시간 데모와 대시보드 확인
+- 예시:
+
+```json
+{"ts": 1712700000.123, "fi": 42, "amp": [1.0, 2.0], "sid": "dev-01"}
+```
+
+### 왜 둘 다 있는가
+- binary ADR-018은 collector에서 raw 재생성과 저장에 유리하다.
+- JSON v1은 inference live 데모에서 파싱과 시뮬레이션이 단순하다.
+- 둘은 역할이 다르며, collector와 inference 계층을 직접 섞지 않는다.
+
+운영자는 binary raw 수집과 JSON live inference를 서로 다른 경로로 이해해야 한다.
 
 ---
 

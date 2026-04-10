@@ -24,6 +24,7 @@ _codex_restore_probe/
 .env.*
 !.env.example
 *.local
+configs/*.local.yaml
 
 # Large datasets and generated runtime outputs
 data/WiFall.zip

@@ -8,7 +8,7 @@ FastAPI application that:
 The SSE stream can be driven by any of:
   source_mode=replay     — replays WiFall manifest windows (Step 3 default)
   source_mode=mock_live  — synthetic random windows (no hardware needed)
-  source_mode=esp32      — placeholder for future live ESP32 input
+  source_mode=esp32      — JSON v1 UDP live source for ESP32/local senders
 
 Configuration is passed via environment variables (set by scripts/replay_dashboard.py):
 
@@ -85,7 +85,11 @@ def generate_events(
     pipeline = InferencePipeline.from_config(config_path)
 
     for step_idx, csi_window in enumerate(source.windows(stop_event)):
-        yield pipeline.step(csi_window, step_idx)
+        event = pipeline.step(csi_window, step_idx)
+        source_status = source.get_runtime_status()
+        if source_status is not None:
+            event.source_status = source_status
+        yield event
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import numpy as np
 
 from preprocessing.decoder import decode_packets
 from preprocessing.features import FEATURE_VERSION, FeatureMatrixBundle, extract_window_features
+from preprocessing.filters import filter_decoded_packets
 from preprocessing.session_loader import RawSession, load_raw_session, load_raw_session_by_id
 from preprocessing.windowing import build_windows, resolve_node_order
 from shared.config import PreprocessingConfig
@@ -67,9 +68,15 @@ def process_loaded_raw_session(
         raw_session.packets,
         phase_unwrap_enabled=preprocessing_config.phase_unwrap_enabled,
     )
-    node_order = resolve_node_order(decoded_packets, expected_nodes=expected_nodes)
-    windows = build_windows(
+    filtered_packets = filter_decoded_packets(
         decoded_packets,
+        outlier_zscore_threshold=preprocessing_config.outlier_zscore_threshold,
+        median_filter_kernel_size=preprocessing_config.median_filter_kernel_size,
+        smoothing_window_size=preprocessing_config.smoothing_window_size,
+    )
+    node_order = resolve_node_order(filtered_packets, expected_nodes=expected_nodes)
+    windows = build_windows(
+        filtered_packets,
         session_id=raw_session.metadata.session_id,
         window_seconds=preprocessing_config.window_seconds,
         stride_seconds=preprocessing_config.stride_seconds,

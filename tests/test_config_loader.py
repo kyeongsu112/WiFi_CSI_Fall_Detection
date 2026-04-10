@@ -20,6 +20,9 @@ def test_load_all_configs(config_dir: Path) -> None:
     assert bundle.inference.confirm_window_seconds == 8
     assert bundle.preprocessing.window_seconds > 0
     assert bundle.preprocessing.stride_seconds > 0
+    assert bundle.preprocessing.outlier_zscore_threshold > 0
+    assert bundle.preprocessing.median_filter_kernel_size >= 1
+    assert bundle.preprocessing.smoothing_window_size >= 1
     assert bundle.training.runtime_labels == ["non_fall", "fall"]
 
 

@@ -11,8 +11,8 @@ Source modes
                No manifest or zip file needed.  Use this to test the full
                SSE pipeline without WiFall data or hardware.
 
-    esp32      Placeholder for future live ESP32 UDP integration.
-               Raises NotImplementedError until implemented.
+    esp32      Listen for JSON v1 UDP frames from an ESP32 or a local sender.
+               Useful for live smoke tests and dashboard demos.
 
 Usage examples
 --------------
@@ -21,6 +21,9 @@ Usage examples
 
     # mock live mode:
     python scripts/replay_dashboard.py --source mock_live
+
+    # esp32 live mode with a local override config:
+    python scripts/replay_dashboard.py --source esp32 --config configs/inference.local.yaml
 
     # custom replay with slower pacing:
     python scripts/replay_dashboard.py \\

@@ -4,7 +4,7 @@ Step 4 introduces a common interface so the dashboard can run with any of:
 
     replay    — windows from the WiFall manifest + zip (Step 3 behaviour, unchanged)
     mock_live — synthetic random windows for end-to-end pipeline testing without hardware
-    esp32     — placeholder for future live ESP32 UDP integration
+    esp32     — JSON v1 UDP live source for ESP32/local senders
 
 Window contract (matches FallDetector in training/model.py):
     CsiWindow.data  shape (52, 100)  float32
@@ -29,6 +29,9 @@ Usage
 """
 from __future__ import annotations
 
+import json
+import logging
+import socket
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -42,8 +45,12 @@ import torch
 from inference.replay import (
     ReplayConfig,
     ReplayEvent,
-    SimpleConfirmationEngine,
     load_replay_config,
+)
+from inference.confirmation import (
+    ConfirmationConfig,
+    ConfirmationEngine,
+    compute_motion_score,
 )
 from training.model import load_model
 
@@ -60,10 +67,12 @@ class CsiWindow:
         data:         float32 ndarray of shape (52, 100).
         source_file:  Human-readable origin label ("" for generated windows).
         window_index: Position within the originating session or stream.
+        duration_seconds: Logical duration represented by the window.
     """
     data: np.ndarray   # (n_subcarriers=52, window_size=100), float32
     source_file: str = ""
     window_index: int = 0
+    duration_seconds: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,9 @@ class CsiSource(ABC):
         self, stop_event: threading.Event | None = None
     ) -> Generator[CsiWindow, None, None]:
         """Yield normalised CsiWindow objects until exhausted or stop_event is set."""
+
+    def get_runtime_status(self) -> dict[str, object] | None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +126,7 @@ class ReplaySource(CsiSource):
         self.zip_path = zip_path
         self.config_path = config_path
         self.step_delay = step_delay
+        self._windows_emitted = 0
 
     def windows(
         self, stop_event: threading.Event | None = None
@@ -145,6 +158,7 @@ class ReplaySource(CsiSource):
                 raw = raw[:_WINDOW_SIZE]
 
             # (window_size, n_subcarriers) → (n_subcarriers, window_size)
+            self._windows_emitted = int(row.window_index) + 1
             yield CsiWindow(
                 data=raw.T.astype(np.float32),
                 source_file=str(row.source_file),
@@ -156,6 +170,16 @@ class ReplaySource(CsiSource):
 
             if stop_event is not None and stop_event.is_set():
                 return
+
+    def get_runtime_status(self) -> dict[str, object]:
+        return {
+            "mode": "replay",
+            "transport_state": "offline",
+            "active_sid": None,
+            "packets_received": 0,
+            "packets_dropped": 0,
+            "windows_emitted": self._windows_emitted,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +205,7 @@ class MockLiveSource(CsiSource):
     ) -> None:
         self.step_delay_seconds = step_delay_seconds
         self._rng = np.random.default_rng(seed)
+        self._windows_emitted = 0
 
     def windows(
         self, stop_event: threading.Event | None = None
@@ -197,6 +222,7 @@ class MockLiveSource(CsiSource):
             ).astype(np.float32)
             data = np.clip(data, 0.0, None)
 
+            self._windows_emitted = step + 1
             yield CsiWindow(
                 data=data,
                 source_file="mock://live",
@@ -211,40 +237,340 @@ class MockLiveSource(CsiSource):
             if stop_event is not None and stop_event.is_set():
                 return
 
+    def get_runtime_status(self) -> dict[str, object]:
+        return {
+            "mode": "mock_live",
+            "transport_state": "synthetic",
+            "active_sid": "mock",
+            "packets_received": 0,
+            "packets_dropped": 0,
+            "windows_emitted": self._windows_emitted,
+        }
+
 
 # ---------------------------------------------------------------------------
-# ESP32 source (placeholder)
+# ESP32 UDP packet parsing
+# ---------------------------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+
+
+def _parse_esp32_packet(
+    raw: bytes,
+    n_subcarriers: int = _N_SUBCARRIERS,
+) -> tuple[np.ndarray, str] | None:
+    """Parse a v1 ESP32 UDP packet.
+
+    Expected format — single-line JSON, all fields except ``amp`` are optional::
+
+        {
+          "ts":  <float>,              # Unix epoch seconds
+          "fi":  <int>,                # frame index (monotonically increasing)
+          "amp": [<float> × 52],       # CSI subcarrier amplitudes  ← REQUIRED
+          "sid": "<str>"               # device / session id  (default "esp32")
+        }
+
+    Args:
+        raw:           Raw UDP payload bytes.
+        n_subcarriers: Expected length of the ``amp`` array (default 52).
+
+    Returns:
+        ``(amplitudes, sid)`` on success, where ``amplitudes`` is a float32
+        ndarray of shape ``(n_subcarriers,)`` and ``sid`` is a string.
+        Returns ``None`` when the packet is malformed or contains non-finite
+        amplitude values (NaN, +Infinity, -Infinity).  Non-finite values must
+        never reach model inference.
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+
+    if not isinstance(obj, dict):
+        return None
+
+    amp = obj.get("amp")
+    if not isinstance(amp, list) or len(amp) != n_subcarriers:
+        return None
+
+    try:
+        arr = np.array(amp, dtype=np.float32)
+    except (ValueError, TypeError):
+        return None
+
+    # Reject NaN / ±Infinity.  These arise from firmware float overflows,
+    # non-standard JSON encoders that emit the bare tokens NaN / Infinity,
+    # or IEEE 754 edge cases in the CSI measurement path.
+    if not np.all(np.isfinite(arr)):
+        return None
+
+    sid = str(obj.get("sid", "esp32"))
+    return arr, sid
+
+
+# ---------------------------------------------------------------------------
+# ESP32 source
 # ---------------------------------------------------------------------------
 
 class Esp32Source(CsiSource):
-    """Placeholder for future live ESP32 UDP source.
+    """Live CSI source that receives UDP packets from an ESP32-S3 device.
 
-    Not yet implemented.  Raises NotImplementedError at construction time.
+    The ESP32 and the laptop must be on the same Wi-Fi network.
+    SSID and password are stored in the ``.env`` file (untracked).
+    See ``.env.example`` for the expected format.
 
-    Future implementation should:
-      1. Open a UDP socket on the configured host/port.
-      2. Receive esp32_adr018-format packets (see collector/ for parsing logic).
-      3. Buffer incoming CSI rows into 100-row windows (stride configurable).
-      4. Yield CsiWindow(data=(52,100), source_file="esp32://...", window_index=N).
+    Packet contract — v1 JSON over UDP
+    ------------------------------------
+    Each UDP datagram is a single-line JSON object::
 
-    See configs/inference.live_esp32.example.yaml for the expected transport
-    parameters, window shape, and model path.
+        {"ts": 1712700000.123, "fi": 42, "amp": [f0, f1, …, f51], "sid": "dev-01"}
+
+    Fields:
+        ts  (float)      Unix epoch seconds.                          Optional.
+        fi  (int)        Frame index, monotonically increasing.       Optional.
+        amp (list[float])  52 CSI subcarrier amplitudes.            **Required.**
+        sid (str)        Device / session identifier.                 Optional (default "esp32").
+
+    Malformed packets (wrong JSON, missing ``amp``, wrong length, or any
+    non-finite amplitude value) are logged at WARNING level and dropped without
+    interrupting the stream.
+
+    Sid lock policy (v1 — single-sender mode)
+    -----------------------------------------
+    The source locks onto the ``sid`` field of the **first valid packet** it
+    receives.  All subsequent packets whose ``sid`` differs from the locked
+    value are dropped with a WARNING log entry.  This prevents frames from
+    two concurrent senders from being silently interleaved into the same model
+    window.
+
+    Reset: create a new :class:`Esp32Source` instance (or restart the server)
+    to unlock and accept a different sender.
+
+    Buffering
+    ---------
+    Frames are accumulated in a FIFO buffer.  Once ``window_size`` (100) frames
+    are ready, one :class:`CsiWindow` of shape ``(52, 100)`` is emitted and the
+    consumed frames are removed.  No overlap in v1 (stride == window_size).
+
+    Window shape
+    ------------
+    ``CsiWindow.data`` is ``float32 ndarray`` of shape ``(n_subcarriers=52, window_size=100)``,
+    matching the contract expected by :class:`InferencePipeline`.
+
+    Logging
+    -------
+    All log output goes to the ``inference.live_source`` logger.  Set the log
+    level to ``DEBUG`` to see per-packet counts; ``INFO`` shows bind/window events.
     """
 
-    def __init__(self, **kwargs: object) -> None:
-        raise NotImplementedError(
-            "Esp32Source is not yet implemented.\n"
-            "To use live ESP32 input:\n"
-            "  1. Implement UDP reception in inference/live_source.py (Esp32Source).\n"
-            "  2. Set source_mode: esp32 in configs/inference.yaml.\n"
-            "  3. See configs/inference.live_esp32.example.yaml for transport details."
-        )
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 5005,
+        window_size: int = _WINDOW_SIZE,
+        n_subcarriers: int = _N_SUBCARRIERS,
+        socket_timeout: float = 0.5,
+        log_every_n_packets: int = 100,
+    ) -> None:
+        """
+        Args:
+            host:                 IP address to bind the UDP socket on.
+                                  ``"0.0.0.0"`` accepts from any interface.
+            port:                 UDP port to listen on (default 5005).
+            window_size:          Frames per model window (default 100).
+            n_subcarriers:        Expected amplitude array length (default 52).
+            socket_timeout:       ``recvfrom`` timeout in seconds; controls how
+                                  quickly ``stop_event`` is checked (default 0.5 s).
+            log_every_n_packets:  Log a DEBUG packet-count summary every N packets
+                                  (default 100).
+        """
+        self.host = host
+        self.port = port
+        self.window_size = window_size
+        self.n_subcarriers = n_subcarriers
+        self.socket_timeout = socket_timeout
+        self.log_every_n_packets = log_every_n_packets
+        self._status_lock = threading.Lock()
+        self._transport_state = "idle"
+        self._active_sid: str | None = None
+        self._packets_received = 0
+        self._packets_dropped = 0
+        self._windows_emitted = 0
 
-    def windows(  # pragma: no cover
+    def windows(
         self, stop_event: threading.Event | None = None
     ) -> Generator[CsiWindow, None, None]:
-        raise NotImplementedError
-        yield  # make mypy happy
+        """Bind UDP socket, receive frames, buffer and yield CsiWindows.
+
+        The socket is bound lazily when this generator is first iterated, so
+        :func:`build_source` and :class:`Esp32Source` construction are free
+        from network side-effects.
+
+        The generator runs indefinitely until ``stop_event`` is set or the
+        calling thread is cancelled.  The socket is always closed in the
+        ``finally`` block.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(self.socket_timeout)
+        sock.bind((self.host, self.port))
+        _log.info("Esp32Source: UDP socket bound on %s:%d", self.host, self.port)
+        self._update_status(transport_state="listening")
+
+        frame_buffer: list[np.ndarray] = []
+        window_index = 0
+        packets_received = 0
+        packets_dropped = 0
+        # Single-sender sid lock: set on first valid packet, immutable until reset.
+        active_sid: str | None = None
+
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
+
+                try:
+                    raw, addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    packets_dropped += 1
+                    self._update_status(
+                        transport_state="warning",
+                        packets_dropped=packets_dropped,
+                    )
+                    _log.warning("Esp32Source: UDP receive error: %s", exc)
+                    time.sleep(min(self.socket_timeout, 0.1))
+                    continue
+
+                packets_received += 1
+                self._update_status(
+                    transport_state="streaming" if active_sid is not None else "listening",
+                    packets_received=packets_received,
+                )
+                if packets_received % self.log_every_n_packets == 0:
+                    _log.debug(
+                        "Esp32Source: %d packets received, %d dropped",
+                        packets_received,
+                        packets_dropped,
+                    )
+
+                parsed = _parse_esp32_packet(raw, self.n_subcarriers)
+                if parsed is None:
+                    packets_dropped += 1
+                    self._update_status(
+                        transport_state="warning",
+                        packets_received=packets_received,
+                        packets_dropped=packets_dropped,
+                    )
+                    _log.warning(
+                        "Esp32Source: malformed packet #%d from %s — dropped",
+                        packets_received,
+                        addr,
+                    )
+                    continue
+
+                amp, sid = parsed
+
+                # Sid lock: lock onto the first observed sender and reject others.
+                if active_sid is None:
+                    active_sid = sid
+                    self._update_status(
+                        transport_state="streaming",
+                        active_sid=active_sid,
+                        packets_received=packets_received,
+                        packets_dropped=packets_dropped,
+                    )
+                    _log.info("Esp32Source: locked onto sender sid=%r", active_sid)
+                elif sid != active_sid:
+                    packets_dropped += 1
+                    self._update_status(
+                        transport_state="warning",
+                        active_sid=active_sid,
+                        packets_received=packets_received,
+                        packets_dropped=packets_dropped,
+                    )
+                    _log.warning(
+                        "Esp32Source: packet from sid=%r dropped "
+                        "(locked onto sid=%r; mixed-sender streams not supported in v1)",
+                        sid,
+                        active_sid,
+                    )
+                    continue
+
+                frame_buffer.append(amp)
+
+                if len(frame_buffer) >= self.window_size:
+                    frames = np.stack(frame_buffer[: self.window_size], axis=0)  # (100, 52)
+                    csi_window = CsiWindow(
+                        data=frames.T.astype(np.float32),  # (52, 100)
+                        source_file=f"esp32://{sid}",
+                        window_index=window_index,
+                    )
+                    _log.info(
+                        "Esp32Source: window #%d emitted (source=%s)",
+                        window_index,
+                        csi_window.source_file,
+                    )
+                    self._update_status(
+                        transport_state="streaming",
+                        active_sid=active_sid,
+                        packets_received=packets_received,
+                        packets_dropped=packets_dropped,
+                        windows_emitted=window_index + 1,
+                    )
+                    yield csi_window
+                    window_index += 1
+                    frame_buffer = frame_buffer[self.window_size :]  # v1: no overlap
+        finally:
+            sock.close()
+            self._update_status(
+                transport_state="closed",
+                active_sid=active_sid,
+                packets_received=packets_received,
+                packets_dropped=packets_dropped,
+                windows_emitted=window_index,
+            )
+            _log.info(
+                "Esp32Source: socket closed — received=%d dropped=%d windows=%d",
+                packets_received,
+                packets_dropped,
+                window_index,
+            )
+
+    def get_runtime_status(self) -> dict[str, object]:
+        with self._status_lock:
+            return {
+                "mode": "esp32",
+                "transport_state": self._transport_state,
+                "active_sid": self._active_sid,
+                "packets_received": self._packets_received,
+                "packets_dropped": self._packets_dropped,
+                "windows_emitted": self._windows_emitted,
+            }
+
+    def _update_status(
+        self,
+        *,
+        transport_state: str | None = None,
+        active_sid: str | None = None,
+        packets_received: int | None = None,
+        packets_dropped: int | None = None,
+        windows_emitted: int | None = None,
+    ) -> None:
+        with self._status_lock:
+            if transport_state is not None:
+                self._transport_state = transport_state
+            if active_sid is not None:
+                self._active_sid = active_sid
+            if packets_received is not None:
+                self._packets_received = packets_received
+            if packets_dropped is not None:
+                self._packets_dropped = packets_dropped
+            if windows_emitted is not None:
+                self._windows_emitted = windows_emitted
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +591,16 @@ class InferencePipeline:
     def __init__(self, cfg: ReplayConfig) -> None:
         self.cfg = cfg
         self._model, _ = load_model(cfg.model_path)
-        self._engine = SimpleConfirmationEngine(
-            threshold=cfg.candidate_threshold,
-            confirm_n=cfg.confirm_n_windows,
-            cooldown_n=cfg.cooldown_windows,
+        self._engine = ConfirmationEngine(
+            ConfirmationConfig(
+                candidate_threshold=cfg.candidate_threshold,
+                inactivity_seconds=cfg.post_fall_inactivity_seconds,
+                motion_threshold=cfg.motion_floor_threshold,
+                confirm_window_seconds=cfg.confirm_window_seconds,
+                cooldown_seconds=cfg.cooldown_seconds,
+            )
         )
+        self._previous_window: np.ndarray | None = None
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> "InferencePipeline":
@@ -293,8 +624,10 @@ class InferencePipeline:
             logit: float = self._model(x).item()
 
         prob: float = float(torch.sigmoid(torch.tensor(logit)))
+        motion_score = compute_motion_score(window.data, self._previous_window)
+        self._previous_window = window.data
         predicted_label = "fall" if prob >= self.cfg.candidate_threshold else "non_fall"
-        alert_state = self._engine.step(prob)
+        alert_state = self._engine.step(prob, motion_score, window.duration_seconds)
 
         return ReplayEvent(
             step=step_idx,
@@ -303,6 +636,7 @@ class InferencePipeline:
             probability=prob,
             predicted_label=predicted_label,
             alert_state=alert_state,
+            motion_score=motion_score,
         )
 
 
@@ -331,8 +665,7 @@ def build_source(
         A CsiSource ready for use in the inference pipeline.
 
     Raises:
-        ValueError:          Unknown source_mode.
-        NotImplementedError: source_mode == "esp32" (not yet implemented).
+        ValueError: Unknown source_mode.
     """
     if source_mode == "replay":
         return ReplaySource(
@@ -346,7 +679,15 @@ def build_source(
         delay = step_delay if step_delay is not None else cfg.step_delay_seconds
         return MockLiveSource(step_delay_seconds=delay)
     if source_mode == "esp32":
-        return Esp32Source()
+        try:
+            from shared.config import load_inference_config
+            icfg = load_inference_config(Path(config_path))
+            host = icfg.esp32_udp_host
+            port = icfg.esp32_udp_port
+        except (FileNotFoundError, OSError):
+            host = "0.0.0.0"
+            port = 5005
+        return Esp32Source(host=host, port=port)
     raise ValueError(
         f"Unknown source_mode: {source_mode!r}. "
         "Valid choices: 'replay', 'mock_live', 'esp32'."

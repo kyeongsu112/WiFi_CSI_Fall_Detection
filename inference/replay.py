@@ -23,6 +23,11 @@ import pandas as pd
 import torch
 import yaml
 
+from inference.confirmation import (
+    ConfirmationConfig,
+    ConfirmationEngine,
+    compute_motion_score,
+)
 from training.model import load_model
 
 
@@ -34,6 +39,11 @@ from training.model import load_model
 class ReplayConfig:
     model_path: str = "artifacts/models/wifall_baseline.pt"
     candidate_threshold: float = 0.01
+    post_fall_inactivity_seconds: float = 6.0
+    motion_floor_threshold: float = 0.15
+    confirm_window_seconds: float = 8.0
+    cooldown_seconds: float = 5.0
+    window_duration_seconds: float = 1.0
     confirm_n_windows: int = 3       # consecutive candidate windows to confirm
     cooldown_windows: int = 10       # windows to spend in cooldown before idle
     step_delay_seconds: float = 0.05 # inter-window sleep for demo pacing
@@ -46,6 +56,11 @@ def load_replay_config(config_path: str | Path = "configs/inference.yaml") -> Re
     return ReplayConfig(
         model_path=raw.get("model_path", "artifacts/models/wifall_baseline.pt"),
         candidate_threshold=float(raw.get("candidate_threshold", 0.01)),
+        post_fall_inactivity_seconds=float(raw.get("post_fall_inactivity_seconds", 6.0)),
+        motion_floor_threshold=float(raw.get("motion_floor_threshold", 0.15)),
+        confirm_window_seconds=float(raw.get("confirm_window_seconds", 8.0)),
+        cooldown_seconds=float(raw.get("cooldown_seconds", 5.0)),
+        window_duration_seconds=float(raw.get("window_duration_seconds", 1.0)),
         confirm_n_windows=int(raw.get("confirm_n_windows", 3)),
         cooldown_windows=int(raw.get("cooldown_windows", 10)),
         step_delay_seconds=float(raw.get("step_delay_seconds", 0.05)),
@@ -64,16 +79,24 @@ class ReplayEvent:
     probability: float
     predicted_label: str   # "fall" | "non_fall"
     alert_state: str       # "idle" | "candidate" | "confirmed" | "cooldown"
+    motion_score: float | None = None
+    source_status: dict[str, object] | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "step": self.step,
             "source_file": self.source_file,
             "window_index": self.window_index,
             "probability": round(self.probability, 6),
+            "motion_score": (
+                round(self.motion_score, 6) if self.motion_score is not None else None
+            ),
             "predicted_label": self.predicted_label,
             "alert_state": self.alert_state,
         }
+        if self.source_status is not None:
+            payload["source_status"] = dict(self.source_status)
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +196,16 @@ def replay_manifest(
     window_size: int = meta.get("window_size", 100)
     n_subcarriers: int = meta.get("n_subcarriers", 52)
 
-    engine = SimpleConfirmationEngine(
-        threshold=cfg.candidate_threshold,
-        confirm_n=cfg.confirm_n_windows,
-        cooldown_n=cfg.cooldown_windows,
+    engine = ConfirmationEngine(
+        ConfirmationConfig(
+            candidate_threshold=cfg.candidate_threshold,
+            inactivity_seconds=cfg.post_fall_inactivity_seconds,
+            motion_threshold=cfg.motion_floor_threshold,
+            confirm_window_seconds=cfg.confirm_window_seconds,
+            cooldown_seconds=cfg.cooldown_seconds,
+        )
     )
+    previous_window: np.ndarray | None = None
 
     manifest = pd.read_csv(manifest_path)
 
@@ -199,21 +227,25 @@ def replay_manifest(
 
         # (window_size, n_subcarriers) → transpose → (n_subcarriers, window_size)
         # then add batch dim → (1, n_subcarriers, window_size)
-        x = torch.tensor(window.T[np.newaxis], dtype=torch.float32)
+        window_data = window.T.astype(np.float32)
+        x = torch.tensor(window_data[np.newaxis], dtype=torch.float32)
 
         with torch.no_grad():
             logit: float = model(x).item()
 
         prob: float = float(torch.sigmoid(torch.tensor(logit)))
+        motion_score = compute_motion_score(window_data, previous_window)
+        previous_window = window_data
 
         predicted_label = "fall" if prob >= cfg.candidate_threshold else "non_fall"
-        alert_state = engine.step(prob)
+        alert_state = engine.step(prob, motion_score, cfg.window_duration_seconds)
 
         yield ReplayEvent(
             step=step,
             source_file=source_file,
             window_index=window_index,
             probability=prob,
+            motion_score=motion_score,
             predicted_label=predicted_label,
             alert_state=alert_state,
         )
