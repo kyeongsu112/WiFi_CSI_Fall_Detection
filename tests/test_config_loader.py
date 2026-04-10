@@ -15,7 +15,7 @@ def test_load_all_configs(config_dir: Path) -> None:
     assert bundle.collection.udp_host
     assert 1 <= bundle.collection.udp_port <= 65535
     assert bundle.collection.expected_nodes
-    assert bundle.inference.candidate_threshold == 0.75
+    assert bundle.inference.candidate_threshold == 0.01
     assert bundle.inference.post_fall_inactivity_seconds == 6
     assert bundle.inference.confirm_window_seconds == 8
     assert bundle.preprocessing.window_seconds > 0

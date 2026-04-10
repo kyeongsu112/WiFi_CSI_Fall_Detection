@@ -64,8 +64,8 @@ class TrainingConfig(BaseModel):
 class InferenceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    model_path: str = "artifacts/models/baseline.joblib"
-    candidate_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    model_path: str = "artifacts/models/wifall_baseline.pt"
+    candidate_threshold: float = Field(default=0.01, ge=0.0, le=1.0)
     post_fall_inactivity_seconds: int = Field(default=6, ge=1)
     motion_floor_threshold: float = Field(default=0.15, ge=0.0)
     confirm_window_seconds: int = Field(default=8, ge=1)

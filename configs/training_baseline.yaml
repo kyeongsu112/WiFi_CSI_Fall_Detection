@@ -32,8 +32,13 @@ model:
   dropout: 0.5
 
 output:
-  model_path: artifacts/models/wifall_baseline.pt
-  metrics_path: artifacts/reports/wifall_baseline_metrics.json
-  distribution_path: artifacts/reports/wifall_subject_distribution.csv
-  predictions_path: artifacts/reports/wifall_baseline_predictions.csv
+  model_path:            artifacts/models/wifall_baseline.pt
+  metrics_path:          artifacts/reports/wifall_baseline_metrics.json
+  distribution_path:     artifacts/reports/wifall_baseline_subject_distribution.csv
+  predictions_path:      artifacts/reports/wifall_baseline_predictions.csv
   confusion_matrix_path: artifacts/reports/wifall_baseline_confusion_matrix.png
+  threshold_sweep_path:  artifacts/reports/wifall_baseline_threshold_sweep.csv
+  roc_curve_path:        artifacts/reports/wifall_baseline_roc_curve.png
+  pr_curve_path:         artifacts/reports/wifall_baseline_pr_curve.png
+  score_distribution_path: artifacts/reports/wifall_baseline_score_distribution.csv
+  score_histogram_path:  artifacts/reports/wifall_baseline_score_histogram.png

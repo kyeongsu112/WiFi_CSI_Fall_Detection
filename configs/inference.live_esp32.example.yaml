@@ -1,4 +1,4 @@
-model_path: artifacts/models/baseline.joblib
+model_path: artifacts/models/wifall_baseline.pt
 candidate_threshold: 0.75
 post_fall_inactivity_seconds: 6
 motion_floor_threshold: 0.15

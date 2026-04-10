@@ -1,9 +1,26 @@
-model_path: artifacts/models/baseline.joblib
-candidate_threshold: 0.75
+# Inference / ConfirmationEngine configuration
+#
+# model_path
+#   PyTorch checkpoint produced by scripts/train_baseline.py.
+#   Must be the .pt file, not a .joblib artifact.
+#
+# candidate_threshold
+#   Score (sigmoid probability) above which a window enters "candidate" state.
+#
+#   Chosen from Step 2 threshold sweep (wifall_baseline_threshold_sweep.csv):
+#     t=0.01 → F1=0.40, recall=0.28, precision=0.69  (best F1 in sweep)
+#     t=0.75 → F1=0.06, recall=0.03, precision=1.00  (original — unusable)
+#
+#   0.01 is set here as the initial demo value.  The ConfirmationEngine's
+#   inactivity filter (post_fall_inactivity_seconds + motion_floor_threshold)
+#   suppresses spurious candidates, so a low threshold is safe for replay.
+#   Re-evaluate after Step 3 KNN-MMD improves score distributions.
+
+model_path: artifacts/models/wifall_baseline.pt
+candidate_threshold: 0.01
 post_fall_inactivity_seconds: 6
 motion_floor_threshold: 0.15
 confirm_window_seconds: 8
 cooldown_seconds: 5
-# For smoke testing, 5 seconds is long enough to detect a stopped node
-# without flapping too aggressively on brief Wi-Fi jitter.
+# 5 s is long enough for smoke tests without flapping on Wi-Fi jitter
 health_timeout_seconds: 5

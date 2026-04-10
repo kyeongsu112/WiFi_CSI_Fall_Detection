@@ -242,4 +242,8 @@ def evaluate(model: FallDetector, dataset: WifallDataset, cfg: dict) -> dict:
         "f1": f1,
         "confusion_matrix": [[tn, fp], [fn, tp]],
         "raw_predictions": raw_predictions,
+        # Raw scores — available for threshold sweep and curve generation
+        # without re-running inference.
+        "all_probs": all_probs,
+        "all_labels": all_labels,
     }
