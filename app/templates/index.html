@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFall – Fall Detection Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117;
+    color: #e6edf3;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+    gap: 1.5rem;
+  }
+
+  h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: #58a6ff;
+  }
+
+  /* ── State badge ── */
+  #state-badge {
+    display: inline-block;
+    padding: 0.45rem 1.4rem;
+    border-radius: 999px;
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    transition: background 0.25s, color 0.25s;
+  }
+  .state-idle      { background: #21262d; color: #8b949e; }
+  .state-candidate { background: #2d3b1a; color: #d2a679; border: 1px solid #d2a679; }
+  .state-confirmed { background: #3d1a1a; color: #f85149; border: 1px solid #f85149; }
+  .state-cooldown  { background: #1a2a3d; color: #58a6ff; border: 1px solid #58a6ff; }
+
+  /* ── Score gauge ── */
+  .gauge-wrap {
+    width: 100%;
+    max-width: 480px;
+  }
+  .gauge-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: #8b949e;
+    margin-bottom: 0.3rem;
+  }
+  .gauge-track {
+    width: 100%;
+    height: 14px;
+    background: #21262d;
+    border-radius: 7px;
+    overflow: hidden;
+  }
+  .gauge-fill {
+    height: 100%;
+    width: 0%;
+    background: #238636;
+    border-radius: 7px;
+    transition: width 0.18s ease, background 0.18s ease;
+  }
+
+  /* ── Stats grid ── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+    width: 100%;
+    max-width: 800px;
+  }
+  .stat-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+  }
+  .stat-card .label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #8b949e;
+    margin-bottom: 0.35rem;
+  }
+  .stat-card .value {
+    font-size: 1.1rem;
+    font-weight: 600;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    color: #e6edf3;
+    word-break: break-all;
+  }
+
+  /* ── Event log ── */
+  .log-wrap {
+    width: 100%;
+    max-width: 800px;
+  }
+  .log-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+  }
+  #event-log {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 0.75rem;
+    height: 220px;
+    overflow-y: auto;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    line-height: 1.6;
+  }
+  #event-log .entry       { color: #8b949e; }
+  #event-log .entry.fall  { color: #f85149; }
+  #event-log .entry.warn  { color: #d2a679; }
+  #event-log .entry.ok    { color: #3fb950; }
+  #event-log .entry.info  { color: #58a6ff; }
+
+  /* ── Status bar ── */
+  #status-bar {
+    font-size: 0.78rem;
+    color: #8b949e;
+  }
+</style>
+</head>
+<body>
+
+<h1>WiFall · Fall Detection Dashboard</h1>
+
+<!-- Alert state badge -->
+<div id="state-badge" class="state-idle">idle</div>
+
+<!-- Score gauge -->
+<div class="gauge-wrap">
+  <div class="gauge-label">
+    <span>Fall probability</span>
+    <span id="prob-text">—</span>
+  </div>
+  <div class="gauge-track">
+    <div class="gauge-fill" id="gauge-fill"></div>
+  </div>
+</div>
+
+<!-- Stat cards -->
+<div class="stats">
+  <div class="stat-card">
+    <div class="label">Replay step</div>
+    <div class="value" id="stat-step">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Window index</div>
+    <div class="value" id="stat-window">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Predicted label</div>
+    <div class="value" id="stat-label">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Alert state</div>
+    <div class="value" id="stat-state">—</div>
+  </div>
+  <div class="stat-card" style="grid-column: 1 / -1;">
+    <div class="label">Source file</div>
+    <div class="value" id="stat-source" style="font-size:0.82rem;">—</div>
+  </div>
+</div>
+
+<!-- Event log -->
+<div class="log-wrap">
+  <div class="log-title">Event log</div>
+  <div id="event-log"></div>
+</div>
+
+<div id="status-bar">Connecting…</div>
+
+<script>
+  const badge    = document.getElementById('state-badge');
+  const gaugeFill= document.getElementById('gauge-fill');
+  const probText = document.getElementById('prob-text');
+  const statStep = document.getElementById('stat-step');
+  const statWin  = document.getElementById('stat-window');
+  const statLbl  = document.getElementById('stat-label');
+  const statState= document.getElementById('stat-state');
+  const statSrc  = document.getElementById('stat-source');
+  const logEl    = document.getElementById('event-log');
+  const statusBar= document.getElementById('status-bar');
+
+  // State → CSS class
+  const stateClass = {
+    idle:      'state-idle',
+    candidate: 'state-candidate',
+    confirmed: 'state-confirmed',
+    cooldown:  'state-cooldown',
+  };
+
+  let prevState = 'idle';
+
+  function appendLog(msg, cls) {
+    const ts   = new Date().toLocaleTimeString();
+    const line = document.createElement('div');
+    line.className = 'entry ' + (cls || '');
+    line.textContent = `[${ts}]  ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setGaugeColor(prob) {
+    if (prob >= 0.5)      return '#f85149';   // red
+    if (prob >= 0.1)      return '#d2a679';   // orange
+    if (prob >= 0.01)     return '#e3b341';   // yellow
+    return '#238636';                          // green
+  }
+
+  function update(d) {
+    const prob  = d.probability;
+    const state = d.alert_state;
+
+    // Badge
+    badge.textContent = state.toUpperCase();
+    badge.className   = 'state-' + state;
+
+    // Gauge (log scale from 0.001 → 1.0)
+    const pct = Math.min(100, Math.max(0, (Math.log10(prob + 0.001) + 3) / 3 * 100));
+    gaugeFill.style.width      = pct + '%';
+    gaugeFill.style.background = setGaugeColor(prob);
+    probText.textContent       = prob.toFixed(4);
+
+    // Stat cards
+    statStep.textContent  = d.step;
+    statWin.textContent   = d.window_index;
+    statLbl.textContent   = d.predicted_label;
+    statState.textContent = state;
+    statSrc.textContent   = d.source_file;
+
+    // Log notable transitions
+    if (state !== prevState) {
+      const cls = {
+        idle:      'entry',
+        candidate: 'warn',
+        confirmed: 'fall',
+        cooldown:  'info',
+      }[state] || 'entry';
+      appendLog(
+        `[step ${d.step}] ${prevState} → ${state}  (prob=${prob.toFixed(4)}, src=${d.source_file})`,
+        cls
+      );
+      prevState = state;
+    }
+  }
+
+  function connect() {
+    const es = new EventSource('/stream');
+
+    es.onopen = () => {
+      statusBar.textContent = 'Streaming…';
+      appendLog('Replay started.', 'ok');
+    };
+
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.error) {
+          appendLog('ERROR: ' + d.error, 'fall');
+          statusBar.textContent = 'Error – see log';
+          es.close();
+          return;
+        }
+        update(d);
+        statusBar.textContent = `Step ${d.step} · ${d.alert_state}`;
+      } catch (e) {
+        appendLog('Parse error: ' + e.message, 'fall');
+      }
+    };
+
+    es.addEventListener('done', () => {
+      appendLog('Replay complete.', 'ok');
+      statusBar.textContent = 'Replay complete.';
+      es.close();
+    });
+
+    es.onerror = () => {
+      appendLog('Connection lost – retrying…', 'warn');
+      statusBar.textContent = 'Reconnecting…';
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>

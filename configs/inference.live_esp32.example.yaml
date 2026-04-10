@@ -1,9 +1,22 @@
+# Example inference config for live ESP32 deployment.
+# Copy to configs/inference.yaml and tune for your hardware.
+#
+# candidate_threshold: 0.50 matches the replay-validated value in inference.yaml.
+# Re-tune after collecting live CSI from your environment — on-device amplitude
+# distributions may differ from the WiFall CSV recordings.
+
 model_path: artifacts/models/wifall_baseline.pt
-candidate_threshold: 0.75
+candidate_threshold: 0.50
+
+# --- Live ESP32 mode (time-based ConfirmationEngine in inference/confirmation.py) ---
 post_fall_inactivity_seconds: 6
 motion_floor_threshold: 0.15
 confirm_window_seconds: 8
 cooldown_seconds: 5
-# For smoke testing, 5 seconds is long enough to detect a stopped node
-# without flapping too aggressively on brief Wi-Fi jitter.
+# 5 s is long enough for smoke tests without flapping on Wi-Fi jitter
 health_timeout_seconds: 5
+
+# --- Replay demo mode (not used in live mode, kept for schema completeness) ---
+confirm_n_windows: 3
+cooldown_windows: 10
+step_delay_seconds: 0.05
