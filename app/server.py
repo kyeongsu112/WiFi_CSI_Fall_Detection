@@ -1,17 +1,22 @@
-"""WiFall replay dashboard server.
+"""WiFall inference dashboard server.
 
 FastAPI application that:
   - Serves the Jinja2 dashboard at GET /
-  - Streams replay events via SSE at GET /stream
+  - Streams inference events via SSE at GET /stream
   - Exposes GET /health for smoke tests
 
-Configuration is passed in via environment variables set by
-scripts/replay_dashboard.py before uvicorn starts:
+The SSE stream can be driven by any of:
+  source_mode=replay     — replays WiFall manifest windows (Step 3 default)
+  source_mode=mock_live  — synthetic random windows (no hardware needed)
+  source_mode=esp32      — placeholder for future live ESP32 input
 
-    WIFALL_MANIFEST_PATH   path to wifall_manifest.csv
-    WIFALL_ZIP_PATH        path to WiFall.zip
-    WIFALL_CONFIG_PATH     path to inference.yaml
-    WIFALL_STEP_DELAY      inter-window sleep in seconds (float, optional)
+Configuration is passed via environment variables (set by scripts/replay_dashboard.py):
+
+    WIFALL_SOURCE_MODE    source type: replay | mock_live | esp32  (default: replay)
+    WIFALL_CONFIG_PATH    path to inference.yaml
+    WIFALL_MANIFEST_PATH  path to wifall_manifest.csv  (replay mode only)
+    WIFALL_ZIP_PATH       path to WiFall.zip            (replay mode only)
+    WIFALL_STEP_DELAY     inter-window sleep override in seconds (optional)
 """
 from __future__ import annotations
 
@@ -20,13 +25,14 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import Generator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-# Module-level import so tests can patch app.server.replay_manifest
-from inference.replay import replay_manifest
+from inference.live_source import resolve_source_mode
+from inference.replay import ReplayEvent
 
 app = FastAPI(title="WiFi Fall Alert Dashboard")
 
@@ -40,6 +46,46 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 def _get_env(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# Event stream (module-level so tests can patch it)
+# ---------------------------------------------------------------------------
+
+def generate_events(
+    source_mode: str,
+    manifest_path: str,
+    zip_path: str,
+    config_path: str,
+    step_delay: float | None,
+    stop_event: threading.Event,
+) -> Generator[ReplayEvent, None, None]:
+    """Build the source + pipeline and yield ReplayEvents until done or cancelled.
+
+    Defined at module level so tests can patch app.server.generate_events with a
+    stub generator, avoiding real model/manifest I/O in unit tests.
+
+    Args:
+        source_mode:   "replay" | "mock_live" | "esp32"
+        manifest_path: Path to wifall_manifest.csv (replay mode only).
+        zip_path:      Path to WiFall.zip (replay mode only).
+        config_path:   Path to inference.yaml.
+        step_delay:    Override inter-window sleep (None = use config value).
+        stop_event:    Set by the SSE handler when the client disconnects.
+    """
+    from inference.live_source import InferencePipeline, build_source
+
+    source = build_source(
+        source_mode=source_mode,
+        manifest_path=manifest_path,
+        zip_path=zip_path,
+        config_path=config_path,
+        step_delay=step_delay,
+    )
+    pipeline = InferencePipeline.from_config(config_path)
+
+    for step_idx, csi_window in enumerate(source.windows(stop_event)):
+        yield pipeline.step(csi_window, step_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -58,15 +104,17 @@ async def index(request: Request):
 
 @app.get("/stream")
 async def stream(request: Request):
-    """SSE endpoint.  Each connection triggers its own independent replay run.
+    """SSE endpoint.  Each connection runs its own independent inference loop.
 
-    The replay worker thread is cancelled via a stop_event when the client
-    disconnects (browser refresh / tab close), preventing orphan threads.
+    The worker thread is stopped via stop_event when the client disconnects,
+    preventing orphan threads on browser refresh/reconnect.
     """
+    config_path   = _get_env("WIFALL_CONFIG_PATH",   "configs/inference.yaml")
+    # Precedence: WIFALL_SOURCE_MODE env var > config source_mode > "replay"
+    source_mode   = resolve_source_mode(os.environ.get("WIFALL_SOURCE_MODE"), config_path)
     manifest_path = _get_env("WIFALL_MANIFEST_PATH", "artifacts/processed/wifall_manifest.csv")
     zip_path      = _get_env("WIFALL_ZIP_PATH",      "data/WiFall.zip")
-    config_path   = _get_env("WIFALL_CONFIG_PATH",   "configs/inference.yaml")
-    delay_env     = _get_env("WIFALL_STEP_DELAY",     "")
+    delay_env     = _get_env("WIFALL_STEP_DELAY",    "")
     step_delay    = float(delay_env) if delay_env else None
 
     async def event_generator():
@@ -74,14 +122,11 @@ async def stream(request: Request):
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
-        def run_replay() -> None:
+        def run_thread() -> None:
             try:
-                for event in replay_manifest(
-                    manifest_path=manifest_path,
-                    zip_path=zip_path,
-                    config_path=config_path,
-                    step_delay=step_delay,
-                    stop_event=stop_event,
+                for event in generate_events(
+                    source_mode, manifest_path, zip_path, config_path,
+                    step_delay, stop_event,
                 ):
                     loop.call_soon_threadsafe(queue.put_nowait, event.to_dict())
             except Exception as exc:
@@ -89,7 +134,7 @@ async def stream(request: Request):
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
-        thread = threading.Thread(target=run_replay, daemon=True)
+        thread = threading.Thread(target=run_thread, daemon=True)
         thread.start()
 
         try:
@@ -99,7 +144,6 @@ async def stream(request: Request):
                 try:
                     payload = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
-                    # Keep-alive comment keeps the browser from timing out
                     yield ": keep-alive\n\n"
                     continue
 
@@ -109,8 +153,6 @@ async def stream(request: Request):
 
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:
-            # Signal the worker to stop at the next window boundary,
-            # regardless of whether we exited via disconnect or normal end.
             stop_event.set()
 
     return StreamingResponse(

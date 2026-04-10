@@ -67,6 +67,12 @@ class InferenceConfig(BaseModel):
     model_path: str = "artifacts/models/wifall_baseline.pt"
     candidate_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
 
+    # Source mode — determines which CsiSource is used by the dashboard.
+    # "replay"    : WiFall manifest + zip (default)
+    # "mock_live" : synthetic random windows for pipeline testing
+    # "esp32"     : placeholder for future live UDP integration
+    source_mode: Literal["replay", "mock_live", "esp32"] = "replay"
+
     # --- Live ESP32 mode (time-based ConfirmationEngine) ---
     post_fall_inactivity_seconds: int = Field(default=6, ge=1)
     motion_floor_threshold: float = Field(default=0.15, ge=0.0)
@@ -74,7 +80,7 @@ class InferenceConfig(BaseModel):
     cooldown_seconds: int = Field(default=5, ge=0)
     health_timeout_seconds: int = Field(default=3, ge=1)
 
-    # --- Replay demo mode (consecutive-window SimpleConfirmationEngine) ---
+    # --- Replay / mock_live mode (consecutive-window SimpleConfirmationEngine) ---
     confirm_n_windows: int = Field(default=3, ge=1)
     cooldown_windows: int = Field(default=10, ge=0)
     step_delay_seconds: float = Field(default=0.05, ge=0.0)

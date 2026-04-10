@@ -1,17 +1,34 @@
-"""Launch the WiFall replay dashboard.
+"""Launch the WiFall inference dashboard.
 
-Sets environment variables read by app/server.py, then starts uvicorn.
+Sets environment variables consumed by app/server.py, then starts uvicorn.
 
-Usage examples:
-    # default paths (manifest + zip + config must exist):
+Source modes
+------------
+    replay     Read windows from the WiFall manifest + zip (default).
+               Requires --manifest and --zip to exist.
+
+    mock_live  Generate synthetic random windows indefinitely.
+               No manifest or zip file needed.  Use this to test the full
+               SSE pipeline without WiFall data or hardware.
+
+    esp32      Placeholder for future live ESP32 UDP integration.
+               Raises NotImplementedError until implemented.
+
+Usage examples
+--------------
+    # replay mode (default):
     python scripts/replay_dashboard.py
 
-    # custom paths:
+    # mock live mode:
+    python scripts/replay_dashboard.py --source mock_live
+
+    # custom replay with slower pacing:
     python scripts/replay_dashboard.py \\
+        --source replay \\
         --manifest artifacts/processed/wifall_manifest.csv \\
         --zip data/WiFall.zip \\
         --config configs/inference.yaml \\
-        --delay 0.05 \\
+        --delay 0.1 \\
         --port 8000
 """
 from __future__ import annotations
@@ -21,26 +38,36 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure project root is on sys.path when run as a script
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+_VALID_SOURCES = ("replay", "mock_live", "esp32")
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="WiFall replay dashboard",
+        description="WiFall inference dashboard",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--source",
+        default=None,
+        choices=_VALID_SOURCES,
+        help=(
+            "CSI source type.  If omitted, the value is read from "
+            "source_mode in the inference config file (default: replay)."
+        ),
     )
     parser.add_argument(
         "--manifest",
         default="artifacts/processed/wifall_manifest.csv",
-        help="Path to wifall_manifest.csv",
+        help="Path to wifall_manifest.csv  (replay mode only)",
     )
     parser.add_argument(
         "--zip",
         default="data/WiFall.zip",
-        help="Path to WiFall.zip",
+        help="Path to WiFall.zip  (replay mode only)",
     )
     parser.add_argument(
         "--config",
@@ -64,32 +91,40 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _check_paths(args: argparse.Namespace) -> None:
-    missing = []
-    for label, path in [
-        ("manifest", args.manifest),
-        ("zip",      args.zip),
-        ("config",   args.config),
-    ]:
-        if not Path(path).exists():
-            missing.append(f"  {label}: {path}")
+def _check_paths(source_mode: str, args: argparse.Namespace) -> None:
+    required = [("config", args.config)]
+    if source_mode == "replay":
+        required += [("manifest", args.manifest), ("zip", args.zip)]
+
+    missing = [
+        f"  {label}: {path}"
+        for label, path in required
+        if not Path(path).exists()
+    ]
     if missing:
         print("ERROR: the following required files are missing:")
         print("\n".join(missing))
-        print("\nHave you run the data-prep and training steps?")
-        print("  python scripts/prepare_wifall.py --config configs/dataset.yaml")
-        print("  python scripts/train_baseline.py --config configs/training_baseline.yaml")
+        if source_mode == "replay":
+            print("\nHave you run the data-prep and training steps?")
+            print("  python scripts/prepare_wifall.py --config configs/dataset.yaml")
+            print("  python scripts/train_baseline.py --config configs/training_baseline.yaml")
         sys.exit(1)
 
 
 def main() -> None:
     args = _parse_args()
-    _check_paths(args)
 
-    # Pass paths to the server via environment variables
-    os.environ["WIFALL_MANIFEST_PATH"] = str(args.manifest)
-    os.environ["WIFALL_ZIP_PATH"]      = str(args.zip)
-    os.environ["WIFALL_CONFIG_PATH"]   = str(args.config)
+    # Resolve source mode: CLI --source > config source_mode > "replay"
+    from inference.live_source import resolve_source_mode
+    source_mode = resolve_source_mode(args.source, args.config)
+
+    _check_paths(source_mode, args)
+
+    os.environ["WIFALL_SOURCE_MODE"] = source_mode
+    os.environ["WIFALL_CONFIG_PATH"] = str(args.config)
+    if source_mode == "replay":
+        os.environ["WIFALL_MANIFEST_PATH"] = str(args.manifest)
+        os.environ["WIFALL_ZIP_PATH"]      = str(args.zip)
     if args.delay is not None:
         os.environ["WIFALL_STEP_DELAY"] = str(args.delay)
 
@@ -99,9 +134,11 @@ def main() -> None:
         print("ERROR: uvicorn not installed.  Run:  pip install uvicorn[standard]")
         sys.exit(1)
 
-    print(f"Dashboard: http://{args.host}:{args.port}")
-    print(f"Manifest : {args.manifest}")
-    print(f"Model    : loaded from {args.config}")
+    print(f"Dashboard : http://{args.host}:{args.port}")
+    print(f"Source    : {source_mode}")
+    if source_mode == "replay":
+        print(f"Manifest  : {args.manifest}")
+    print(f"Config    : {args.config}")
     print("Press Ctrl+C to stop.\n")
 
     uvicorn.run(
