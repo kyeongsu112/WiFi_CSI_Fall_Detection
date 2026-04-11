@@ -112,14 +112,57 @@ def _build_window_starts(
     window_seconds: float,
     stride_seconds: float,
 ) -> tuple[float, ...]:
+    """Return the sequence of window start timestamps.
+
+    Policy
+    ------
+    Short sessions (``last_ts - first_ts < window_seconds``):
+        Exactly one window starting at ``first_ts``.  The window will be
+        sparse but is always emitted so callers get at least one sample.
+
+    Normal sessions:
+        Windows are placed at ``first_ts, first_ts + stride, …`` while
+        ``start_ts < last_ts`` (exclusive upper bound).
+
+        A trailing window at ``last_ts`` is appended ONLY when
+        ``last_ts >= last_window_start + window_seconds`` — i.e., when
+        ``last_ts`` is NOT already covered by the final stride window.  This
+        happens when ``stride >= window_size`` (non-overlapping windows) and
+        the session ends after a data gap wider than one window, leaving an
+        isolated packet that would otherwise be lost entirely.
+
+        In the common case where windows overlap (``stride < window_size``),
+        ``last_ts`` always falls inside the preceding window's range so no
+        trailing window is generated.  This eliminates degenerate 1-packet
+        trailing windows that would produce unreliable inference results.
+
+    Examples
+    --------
+    Packets at [0.0, 0.5, 1.0], window=1.0, stride=0.5 (overlapping):
+        Windows at 0.0 [0.0,1.0) and 0.5 [0.5,1.5).
+        ``last_ts=1.0`` is inside [0.5, 1.5) → no trailing window.
+        Packet at 1.0 captured in window [0.5, 1.5).
+
+    Packets at [0.0, 2.0], window=0.4, stride=0.5 (gap, non-overlapping):
+        Windows at 0.0, 0.5, 1.0, 1.5 from the ``<`` loop.
+        ``last_ts=2.0 >= 1.5 + 0.4 = 1.9`` → trailing window at 2.0 added.
+        Packet at 2.0 captured in window [2.0, 2.4).
+    """
     if last_ts - first_ts < window_seconds:
         return (first_ts,)
 
     window_starts: list[float] = []
     start_ts = first_ts
-    while start_ts <= last_ts:
+    while start_ts < last_ts:   # exclusive: prevent degenerate window at last_ts
         window_starts.append(start_ts)
         start_ts += stride_seconds
+
+    # Add a trailing window only when last_ts is not covered by the last
+    # stride window.  This preserves isolated packets after a data gap while
+    # avoiding sparse trailing windows in the normal overlapping-window case.
+    if not window_starts or last_ts >= window_starts[-1] + window_seconds:
+        window_starts.append(last_ts)
+
     return tuple(window_starts)
 
 

@@ -52,9 +52,12 @@ class ConfirmationEngine:
 
         if self.state == "cooldown":
             self._cooldown_left = max(0.0, self._cooldown_left - dt)
-            if self._cooldown_left == 0.0:
+            if self._cooldown_left <= 0.0:
                 self._reset_to_idle()
-            return self.state
+                # fall through so a high fall_score on this same step can
+                # immediately open a new candidate window
+            else:
+                return self.state
 
         if self.state == "idle" and fall_score >= self.config.candidate_threshold:
             self.state = "candidate"

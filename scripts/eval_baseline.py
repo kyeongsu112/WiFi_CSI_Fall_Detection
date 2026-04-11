@@ -366,18 +366,18 @@ def main() -> None:
     fall_probs     = [p for p, y in zip(all_probs, all_labels) if y == 1]
     nf_probs       = [p for p, y in zip(all_probs, all_labels) if y == 0]
     if fall_probs:
-        print(f"\n  Fall score stats   — "
+        print(f"\n  Fall score stats     - "
               f"min={min(fall_probs):.4f}  "
               f"median={float(np.median(fall_probs)):.4f}  "
               f"max={max(fall_probs):.4f}")
     if nf_probs:
-        print(f"  Non-fall score stats — "
+        print(f"  Non-fall score stats - "
               f"min={min(nf_probs):.4f}  "
               f"median={float(np.median(nf_probs)):.4f}  "
               f"max={max(nf_probs):.4f}")
 
     # ── threshold sweep ───────────────────────────────────────────────────────
-    print("\nRunning threshold sweep (0.01 → 0.99, 99 steps)...")
+    print("\nRunning threshold sweep (0.01 -> 0.99, 99 steps)...")
     sweep = _threshold_sweep(all_probs, all_labels)
     best_row = _best_threshold_row(sweep)
     best_threshold = best_row["threshold"]
@@ -389,7 +389,7 @@ def main() -> None:
     print(f"  F1        : {best_row['f1']:.4f}")
     print(f"  TN={best_row['tn']}  FP={best_row['fp']}  "
           f"FN={best_row['fn']}  TP={best_row['tp']}")
-    print(f"  (Note: threshold selected on test subject — use as a diagnostic guide,")
+    print(f"  (Note: threshold selected on test subject - use as a diagnostic guide,")
     print(f"   not as an unbiased estimate. Consider a dedicated val split for Step 3.)")
 
     _save_threshold_sweep_csv(sweep, sweep_path)
@@ -480,10 +480,10 @@ def main() -> None:
     print(f"  AUC-ROC           : {auc_roc:.4f}")
     print(f"  Avg Precision     : {ap:.4f}")
     print(f"  Default threshold : {default_threshold:.3f}  "
-          f"→  F1={metrics_default['f1']:.4f}  "
+          f"->  F1={metrics_default['f1']:.4f}  "
           f"recall={metrics_default['recall']:.4f}")
     print(f"  Best F1 threshold : {best_threshold:.3f}  "
-          f"→  F1={best_row['f1']:.4f}  "
+          f"->  F1={best_row['f1']:.4f}  "
           f"recall={best_row['recall']:.4f}")
     print("=========================================")
 

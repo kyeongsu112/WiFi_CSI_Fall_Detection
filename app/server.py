@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -33,6 +34,18 @@ from fastapi.templating import Jinja2Templates
 
 from inference.live_source import resolve_source_mode
 from inference.replay import ReplayEvent
+
+_logger = logging.getLogger(__name__)
+
+# Maximum number of inference events buffered between the worker thread and the
+# SSE consumer.  Provides a memory ceiling while true backpressure (below)
+# slows the producer rather than dropping events.
+_SSE_QUEUE_MAXSIZE: int = 256
+
+# How long (seconds) the inference thread will block waiting for queue space
+# before emitting a warning and moving on.  Prevents indefinite stalls when
+# a client stalls but the connection is not yet detected as disconnected.
+_SSE_BACKPRESSURE_TIMEOUT: float = 5.0
 
 app = FastAPI(title="WiFi Fall Alert Dashboard")
 
@@ -46,6 +59,122 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 def _get_env(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+def _blocking_put(
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    item: object,
+    *,
+    timeout: float = _SSE_BACKPRESSURE_TIMEOUT,
+) -> None:
+    """Deliver a regular inference event, blocking up to *timeout* seconds.
+
+    Uses ``run_coroutine_threadsafe`` so the asyncio ``queue.put`` coroutine
+    runs in the event loop while this thread waits.  If the client is still
+    connected but consuming slowly the inference thread slows to match — no
+    events are dropped under normal backpressure.
+
+    Timeout / cancellation semantics
+    ---------------------------------
+    If ``future.result()`` raises ``TimeoutError``, the underlying
+    ``queue.put`` coroutine is still pending in the event loop.  We
+    **cancel it explicitly** to prevent the item from being enqueued *after*
+    the timeout — a late enqueue could corrupt stream ordering or deliver a
+    "dropped" event to the consumer unexpectedly.  After cancellation the
+    event is discarded and a warning is logged.
+
+    Regular-event drop policy
+    --------------------------
+    Regular inference events (non-terminal) may be dropped when the queue
+    stays full for longer than *timeout* seconds.  Terminal events (sentinel
+    and error payload) use :func:`_blocking_put_terminal` instead, which
+    retries until delivered or the consumer disconnects.
+    """
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    try:
+        future.result(timeout=timeout)
+    except TimeoutError:
+        future.cancel()  # prevent late enqueue that would corrupt stream ordering
+        _logger.warning(
+            "SSE queue blocked for %.1f s; cancelling put and dropping one event "
+            "(client may be stalled or connection is closing)",
+            timeout,
+        )
+
+
+async def _put_with_retry(
+    queue: asyncio.Queue,
+    item: object,
+    stop_event: threading.Event,
+    retry_timeout: float,
+) -> None:
+    """Deliver *item* to *queue*, retrying on backpressure, from within the event loop.
+
+    Uses ``queue.full()`` + ``queue.put_nowait()`` instead of
+    ``asyncio.wait_for(queue.put(...))`` to avoid a duplicate-enqueue race:
+
+    * ``asyncio.wait_for`` cancellation is NOT atomic with queue state.  When a
+      slot opens simultaneously with the timeout firing, CPython's task machinery
+      sets ``_must_cancel = True`` AFTER ``Queue._put(item)`` has already run.
+      The task is then marked cancelled, ``wait_for`` raises ``TimeoutError``,
+      and the retry loop enqueues the same item a second time.
+
+    * ``queue.full()`` followed immediately by ``queue.put_nowait()`` with no
+      ``await`` between them is race-free in a single-threaded asyncio event loop
+      — no other coroutine can run between those two statements.
+
+    One call to this coroutine → at most one enqueue of *item*.
+    """
+    while not stop_event.is_set():
+        if not queue.full():
+            queue.put_nowait(item)
+            return  # delivered exactly once
+        _logger.warning(
+            "SSE queue full for %.1f s; retrying terminal event delivery "
+            "(consumer is slow — will retry until delivered or client disconnects)",
+            retry_timeout,
+        )
+        await asyncio.sleep(retry_timeout)
+    _logger.debug(
+        "Terminal event delivery abandoned: consumer already disconnected "
+        "(stop_event is set)."
+    )
+
+
+def _blocking_put_terminal(
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    item: object,
+    stop_event: threading.Event,
+    *,
+    retry_timeout: float = _SSE_BACKPRESSURE_TIMEOUT,
+) -> None:
+    """Deliver a terminal event by scheduling a single retry-capable coroutine.
+
+    Schedules exactly one :func:`_put_with_retry` coroutine for the entire
+    delivery of *item*.  The retry loop runs inside the event loop using a
+    race-free check-then-put pattern — no duplicate-enqueue race.
+
+    If *stop_event* is already set on entry the call returns immediately.
+    The coroutine also checks *stop_event* before each retry, so a disconnect
+    that occurs during delivery abandons the loop without a duplicate put.
+
+    The sentinel ``None`` causes the consumer to emit ``event: done`` and
+    exit its loop (which then sets *stop_event*).  The error payload
+    ``{"error": ...}`` must be delivered before the sentinel so the client
+    sees a clean completion sequence.
+    """
+    if stop_event.is_set():
+        _logger.debug(
+            "Terminal event delivery abandoned: consumer already disconnected "
+            "(stop_event is set)."
+        )
+        return
+    future = asyncio.run_coroutine_threadsafe(
+        _put_with_retry(queue, item, stop_event, retry_timeout), loop
+    )
+    future.result()  # block until delivered or abandoned; timing managed inside
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +253,7 @@ async def stream(request: Request):
     async def event_generator():
         stop_event = threading.Event()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_SSE_QUEUE_MAXSIZE)
 
         def run_thread() -> None:
             try:
@@ -132,11 +261,16 @@ async def stream(request: Request):
                     source_mode, manifest_path, zip_path, config_path,
                     step_delay, stop_event,
                 ):
-                    loop.call_soon_threadsafe(queue.put_nowait, event.to_dict())
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, {"error": str(exc)})
+                    _blocking_put(queue, loop, event.to_dict())
+            except Exception:
+                _logger.exception("Unhandled error in SSE inference worker thread")
+                # Error payload is terminal: retry until delivered or disconnected.
+                _blocking_put_terminal(queue, loop, {"error": "Internal server error"}, stop_event)
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+                # Sentinel is terminal: retry until delivered or disconnected.
+                # Delivery guarantees the consumer sends event: done and exits cleanly
+                # rather than looping on keep-alives indefinitely.
+                _blocking_put_terminal(queue, loop, None, stop_event)
 
         thread = threading.Thread(target=run_thread, daemon=True)
         thread.start()

@@ -7,7 +7,9 @@ model/manifest/zip I/O.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -158,8 +160,10 @@ def test_stream_emits_error_payload_on_generate_exception() -> None:
     error_lines = [l for l in lines if l.startswith("data:")]
     assert error_lines, "expected at least one data line"
     payload = json.loads(error_lines[0].removeprefix("data: "))
+    # Exception details are sanitized; only the "error" key is guaranteed.
     assert "error" in payload
-    assert "simulated generate failure" in payload["error"]
+    # Internal error message must NOT be leaked to SSE clients.
+    assert "simulated generate failure" not in payload["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +218,204 @@ def test_stream_env_overrides_config_source_mode(monkeypatch, tmp_path) -> None:
     with patch("app.server.generate_events", stub):
         _collect_sse_lines()
     assert captured.get("source_mode") == "replay"
+
+
+# ---------------------------------------------------------------------------
+# _blocking_put unit tests
+# ---------------------------------------------------------------------------
+
+def test_blocking_put_cancels_future_on_timeout() -> None:
+    """When queue.put times out, the future must be explicitly cancelled.
+
+    Without cancellation the pending ``queue.put`` coroutine remains scheduled
+    in the event loop and can enqueue the item *after* the timeout, corrupting
+    stream ordering or delivering a "dropped" event to the consumer.
+    """
+    from unittest.mock import MagicMock, patch
+    from app.server import _blocking_put
+
+    mock_future = MagicMock()
+    mock_future.result.side_effect = TimeoutError()
+
+    mock_queue = MagicMock()
+    mock_loop = MagicMock()
+
+    with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+        _blocking_put(mock_queue, mock_loop, {"step": 0}, timeout=0.001)
+
+    mock_future.cancel.assert_called_once(), (
+        "future.cancel() must be called after TimeoutError to prevent late enqueue"
+    )
+
+
+def test_blocking_put_does_not_cancel_on_success() -> None:
+    """When queue.put succeeds within the timeout, cancel must NOT be called."""
+    from unittest.mock import MagicMock, patch
+    from app.server import _blocking_put
+
+    mock_future = MagicMock()
+    mock_future.result.return_value = None  # successful put
+
+    mock_queue = MagicMock()
+    mock_loop = MagicMock()
+
+    with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+        _blocking_put(mock_queue, mock_loop, {"step": 1}, timeout=5.0)
+
+    mock_future.cancel.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _blocking_put_terminal unit tests
+# ---------------------------------------------------------------------------
+
+def test_blocking_put_terminal_delivers_on_first_attempt() -> None:
+    """Terminal event is delivered immediately when the queue has space."""
+    from unittest.mock import MagicMock, patch
+    from app.server import _blocking_put_terminal
+
+    stop_event = threading.Event()
+    mock_future = MagicMock()
+    mock_future.result.return_value = None  # succeeds first try
+
+    with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future) as mock_rct:
+        _blocking_put_terminal(MagicMock(), MagicMock(), None, stop_event)
+
+    mock_rct.assert_called_once()
+    mock_future.cancel.assert_not_called()
+
+
+def test_blocking_put_terminal_schedules_single_delivery_coroutine() -> None:
+    """_blocking_put_terminal schedules exactly one coroutine regardless of queue pressure.
+
+    The retry loop now lives inside _put_with_retry (a single coroutine scheduled
+    via run_coroutine_threadsafe once).  The calling thread blocks on future.result()
+    with no thread-side timeout — all retry timing is managed inside the coroutine.
+
+    Scheduling one coroutine per terminal item eliminates the duplicate-enqueue
+    race that arose when a thread-side cancel fired after the queue.put coroutine
+    had already completed, causing the item to be enqueued and then enqueued again
+    on the next retry.  End-to-end retry behaviour is verified by the real-queue
+    tests in test_sse_backpressure.py (Group A).
+
+    Uses a plain function (not a MagicMock) as the run_coroutine_threadsafe stand-in
+    so the coroutine is closed immediately and no "never awaited" warning is emitted.
+    """
+    import concurrent.futures
+    from unittest.mock import MagicMock, patch
+    from app.server import _blocking_put_terminal
+
+    stop_event = threading.Event()
+    rct_call_count = [0]
+
+    def fake_rct(coro, loop):
+        """Accept and close the coroutine immediately; return a resolved Future."""
+        rct_call_count[0] += 1
+        coro.close()                        # finalise before any reference escapes
+        f: concurrent.futures.Future = concurrent.futures.Future()
+        f.set_result(None)
+        return f
+
+    with patch("asyncio.run_coroutine_threadsafe", new=fake_rct):
+        _blocking_put_terminal(MagicMock(), MagicMock(), {"error": "x"}, stop_event)
+
+    # Exactly one coroutine scheduled — the retry loop lives inside that coroutine.
+    assert rct_call_count[0] == 1, "exactly one delivery coroutine must be scheduled"
+    assert not stop_event.is_set()
+
+
+def test_blocking_put_terminal_skips_if_stop_already_set() -> None:
+    """If stop_event is already set, no put is attempted at all.
+
+    Proves the producer does not continue work after the consumer disconnects:
+    once stop_event is set there is nothing to deliver to.
+    """
+    from unittest.mock import MagicMock, patch
+    from app.server import _blocking_put_terminal
+
+    stop_event = threading.Event()
+    stop_event.set()  # consumer already gone
+
+    with patch("asyncio.run_coroutine_threadsafe") as mock_rct:
+        _blocking_put_terminal(MagicMock(), MagicMock(), None, stop_event)
+
+    mock_rct.assert_not_called()
+
+
+def test_put_with_retry_abandons_when_stop_set_between_retries() -> None:
+    """_put_with_retry exits without enqueuing when stop_event is set mid-retry.
+
+    Simulates client disconnect while the retry loop is waiting for queue space:
+    the coroutine must exit after the in-progress wait_for times out and
+    stop_event is set, without enqueuing a duplicate.
+
+    This tests the internal retry/abandon logic directly (as an async coroutine)
+    because that logic now lives inside _put_with_retry rather than in
+    _blocking_put_terminal's calling-thread loop.
+    """
+    import asyncio as _asyncio
+    from app.server import _put_with_retry
+
+    RETRY_TIMEOUT = 0.02  # 20 ms fast retry
+
+    async def _scenario():
+        queue = _asyncio.Queue(maxsize=1)
+        await queue.put("blocker")       # fill to capacity
+
+        stop_event = threading.Event()
+
+        async def _disconnect():
+            # Set stop_event after one full timeout cycle has elapsed.
+            await _asyncio.sleep(RETRY_TIMEOUT + 0.01)
+            stop_event.set()
+
+        await _asyncio.gather(
+            _disconnect(),
+            _put_with_retry(queue, {"error": "x"}, stop_event, RETRY_TIMEOUT),
+        )
+        # Drain whatever is in the queue and return its contents.
+        items = []
+        while True:
+            try:
+                items.append(queue.get_nowait())
+            except _asyncio.QueueEmpty:
+                break
+        return items
+
+    contents = _asyncio.run(_scenario())
+    # Only the original blocker must be present — terminal item must not be enqueued.
+    assert contents == ["blocker"], (
+        f"expected only the original blocker, got {contents!r} — "
+        "terminal item must not be enqueued after stop_event is set"
+    )
+
+
+def test_stream_delivers_done_event_after_error() -> None:
+    """When generate_events raises, the client receives error then done — not a hang.
+
+    Verifies end-to-end that the error payload is delivered followed by the
+    sentinel (event: done), ensuring a clean terminal sequence even on failure.
+    """
+    def _error_generate(source_mode, manifest_path, zip_path, config_path,
+                        step_delay, stop_event):
+        raise RuntimeError("simulated failure")
+        yield  # make it a generator
+
+    with patch("app.server.generate_events", _error_generate):
+        lines = _collect_sse_lines()
+
+    data_lines = [l for l in lines if l.startswith("data:")]
+    assert data_lines, "expected at least one data line"
+
+    # Error payload must be present and sanitized.
+    error_payload = json.loads(data_lines[0].removeprefix("data: "))
+    assert "error" in error_payload
+    assert "simulated failure" not in error_payload["error"]
+
+    # Stream must terminate with event: done (not hang on keep-alives).
+    assert "event: done" in lines, (
+        "stream must end with event: done after error — not an infinite keep-alive loop"
+    )
 
 
 def test_stream_label_is_non_fall_not_no_fall() -> None:

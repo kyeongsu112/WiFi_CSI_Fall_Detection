@@ -7,6 +7,7 @@ Covers:
   - CSI row counting (count_csi_rows)
   - CSI CSV parsing from a synthetic file-like object (load_csi_from_fileobj)
   - Window-level manifest schema and span validity
+  - Unknown-activity label warning in process_zip
 
 All tests use synthetic in-memory data — no WiFall.zip required.
 """
@@ -14,9 +15,16 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
+import sys
+import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from prepare_wifall import process_zip  # noqa: E402
 
 from datasets.loader import (
     IQ_VECTOR_LEN,
@@ -354,3 +362,89 @@ class TestWindowCountConsistency:
         for row in rows:
             assert isinstance(row, dict)
             assert "window_index" in row
+
+
+# ── process_zip unknown-activity warning ──────────────────────────────────────
+
+def _make_minimal_zip(entry_name: str, n_rows: int = WINDOW_SIZE) -> bytes:
+    """Build an in-memory WiFall.zip with a single CSV entry."""
+    buf = io.BytesIO()
+    csv_bytes = _make_wifall_csv([3, 4] * N_SUBCARRIERS, n_rows=n_rows)
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(entry_name, csv_bytes.read().decode("utf-8"))
+    return buf.getvalue()
+
+
+class TestProcessZipUnknownActivity:
+    """process_zip fails closed on unknown activities by default.
+
+    The opt-in ``allow_unknown_activities=True`` path falls back to 'non_fall'
+    with a warning.
+    """
+
+    def test_unknown_activity_raises_by_default(self, tmp_path):
+        """Default: unknown activity raises ValueError (fail-closed)."""
+        zip_bytes = _make_minimal_zip("WiFall/ID0/dance/test.csv")
+        zip_path = tmp_path / "test.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        with pytest.raises(ValueError, match="dance"):
+            process_zip(zip_path, {"fall": "fall", "walk": "non_fall"})
+
+    def test_unknown_activity_error_names_entry(self, tmp_path):
+        """The ValueError message must name the unknown activity."""
+        zip_bytes = _make_minimal_zip("WiFall/ID0/dance/test.csv")
+        zip_path = tmp_path / "test.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        with pytest.raises(ValueError) as exc_info:
+            process_zip(zip_path, {"fall": "fall"})
+
+        assert "dance" in str(exc_info.value)
+        assert "binary_mapping" in str(exc_info.value).lower() or "allow_unknown" in str(exc_info.value)
+
+    def test_allow_unknown_logs_warning(self, tmp_path, caplog):
+        """allow_unknown_activities=True logs a warning instead of raising."""
+        zip_bytes = _make_minimal_zip("WiFall/ID0/dance/test.csv")
+        zip_path = tmp_path / "test.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        with caplog.at_level(logging.WARNING):
+            rows = process_zip(
+                zip_path,
+                {"fall": "fall", "walk": "non_fall"},
+                allow_unknown_activities=True,
+            )
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("dance" in msg for msg in warning_msgs), (
+            "Expected a warning mentioning the unknown activity 'dance'"
+        )
+
+    def test_allow_unknown_defaults_to_non_fall(self, tmp_path, caplog):
+        """allow_unknown_activities=True maps unknown → 'non_fall'."""
+        zip_bytes = _make_minimal_zip("WiFall/ID0/dance/test.csv")
+        zip_path = tmp_path / "test.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        with caplog.at_level(logging.WARNING):
+            rows = process_zip(
+                zip_path, {"fall": "fall"},
+                allow_unknown_activities=True,
+            )
+
+        assert all(r["binary_label"] == "non_fall" for r in rows)
+
+    def test_known_activity_does_not_warn(self, tmp_path, caplog):
+        """No warning for an activity that IS in binary_mapping."""
+        zip_bytes = _make_minimal_zip("WiFall/ID0/fall/test.csv")
+        zip_path = tmp_path / "test.zip"
+        zip_path.write_bytes(zip_bytes)
+
+        with caplog.at_level(logging.WARNING):
+            rows = process_zip(zip_path, {"fall": "fall"})
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        activity_warnings = [m for m in warning_msgs if "allow_unknown" in m or "binary_mapping" in m.lower()]
+        assert not activity_warnings, "No warning expected for a known activity"
+        assert rows[0]["binary_label"] == "fall"

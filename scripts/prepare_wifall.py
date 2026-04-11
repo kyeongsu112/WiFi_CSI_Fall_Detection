@@ -70,6 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Destination for the subject split YAML.")
     p.add_argument("--split-target", default=None, metavar="SUBJECT",
                    help="Subject used as target (test) set, e.g. ID0 (overrides config).")
+    p.add_argument(
+        "--allow-unknown-activities", action="store_true", default=False,
+        help=(
+            "When set, activities not listed in binary_mapping are silently "
+            "mapped to 'non_fall' with a warning instead of raising an error. "
+            "Use only when you have inspected and intentionally accept the "
+            "unknown activities."
+        ),
+    )
     return p
 
 
@@ -89,6 +98,8 @@ def _load_config(path: str) -> dict:
 def process_zip(
     zip_path: Path,
     binary_mapping: dict[str, str],
+    *,
+    allow_unknown_activities: bool = False,
 ) -> list[dict]:
     """Walk WiFall.zip and emit one manifest row per 1-second window.
 
@@ -97,8 +108,13 @@ def process_zip(
     following Python slice convention: csi[start_row:end_row].
 
     Args:
-        zip_path:       path to WiFall.zip.
-        binary_mapping: lowercase activity → 'fall' | 'non_fall'.
+        zip_path:                  path to WiFall.zip.
+        binary_mapping:            lowercase activity → 'fall' | 'non_fall'.
+        allow_unknown_activities:  if False (default) any activity not present
+                                   in binary_mapping raises ValueError so the
+                                   caller is forced to decide how to label it.
+                                   Set True to silently default to 'non_fall'
+                                   with a logged warning (opt-in lenient mode).
 
     Returns:
         List of window-level manifest dicts. len() equals total window count.
@@ -126,7 +142,23 @@ def process_zip(
                 skipped_unmatched += 1
                 continue
             subject_id, activity_label = parsed   # activity_label is lowercased
-            label = binary_mapping.get(activity_label, "non_fall")
+            label = binary_mapping.get(activity_label)
+            if label is None:
+                if not allow_unknown_activities:
+                    raise ValueError(
+                        f"Activity {activity_label!r} in '{entry}' is not in "
+                        f"binary_mapping {sorted(binary_mapping)}. "
+                        "Add it to configs/dataset.yaml binary_mapping, or pass "
+                        "--allow-unknown-activities (CLI) / "
+                        "allow_unknown_activities=True (API) to default to "
+                        "'non_fall' with a warning."
+                    )
+                log.warning(
+                    "  WARN %s -- activity %r not in binary_mapping; "
+                    "defaulting to 'non_fall' (allow_unknown_activities=True).",
+                    entry, activity_label,
+                )
+                label = "non_fall"
 
             # ── count rows (fast path — no I/Q parsing needed here) ────
             try:
@@ -256,7 +288,11 @@ def main() -> None:
     binary_mapping = {k.lower(): str(v) for k, v in raw_mapping.items()}
     log.info("Binary mapping: %s", binary_mapping)
 
-    rows = process_zip(zip_path, binary_mapping)
+    rows = process_zip(
+        zip_path,
+        binary_mapping,
+        allow_unknown_activities=args.allow_unknown_activities,
+    )
     if not rows:
         log.error(
             "No windows generated from '%s'. "

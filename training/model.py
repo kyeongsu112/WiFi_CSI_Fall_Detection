@@ -81,23 +81,59 @@ def save_model(model: FallDetector, path: str | Path, config: dict) -> None:
 
 
 def load_model(path: str | Path) -> tuple[FallDetector, dict]:
-    """Load checkpoint. Returns (model_in_eval_mode, metadata_dict)."""
+    """Load checkpoint. Returns (model_in_eval_mode, metadata_dict).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the checkpoint file does not exist.
+    ValueError
+        If the checkpoint is missing required keys or the stored state dict
+        is incompatible with the architecture described in the checkpoint.
+    """
     path = Path(path)
-    checkpoint = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Model checkpoint not found: '{path}'. "
+            "Train the model first with scripts/train_baseline.py."
+        )
+    checkpoint = torch.load(path, map_location=torch.device("cpu"), weights_only=True)
+
+    # Validate required key before any further access.
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(
+            f"Checkpoint '{path}' is missing required key 'model_state_dict'. "
+            f"Keys present: {sorted(checkpoint.keys())}. "
+            "The file may be corrupt or was not saved by save_model()."
+        )
+
     model_config = checkpoint.get("model_config", {})
     model_section = model_config.get("model", {})
+    n_subcarriers: int = int(checkpoint.get("n_subcarriers", 52))
+    window_size: int   = int(checkpoint.get("window_size",   100))
+
     model = FallDetector(
-        n_subcarriers=checkpoint.get("n_subcarriers", 52),
+        n_subcarriers=n_subcarriers,
         conv_channels=model_section.get("conv_channels", [64, 128, 128]),
         kernel_sizes=model_section.get("kernel_sizes", [5, 3, 3]),
         dropout=model_section.get("dropout", 0.5),
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        raise ValueError(
+            f"State dict in '{path}' is incompatible with the model "
+            f"architecture derived from the checkpoint metadata "
+            f"(n_subcarriers={n_subcarriers}). "
+            f"Original error: {exc}"
+        ) from exc
+
     model.eval()
     metadata = {
         "model_config": model_config,
-        "input_shape": checkpoint.get("input_shape", [1, 52, 100]),
-        "n_subcarriers": checkpoint.get("n_subcarriers", 52),
-        "window_size": checkpoint.get("window_size", 100),
+        "input_shape": checkpoint.get("input_shape", [1, n_subcarriers, window_size]),
+        "n_subcarriers": n_subcarriers,
+        "window_size": window_size,
     }
     return model, metadata
