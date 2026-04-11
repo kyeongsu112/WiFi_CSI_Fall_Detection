@@ -286,8 +286,6 @@ def _make_pipeline() -> InferencePipeline:
         motion_floor_threshold=0.15,
         confirm_window_seconds=4.0,
         cooldown_seconds=5.0,
-        confirm_n_windows=3,
-        cooldown_windows=10,
         step_delay_seconds=0.0,
     )
     pipeline = object.__new__(InferencePipeline)

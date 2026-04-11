@@ -83,10 +83,15 @@ class InferenceConfig(BaseModel):
     cooldown_seconds: int = Field(default=5, ge=0)
     health_timeout_seconds: int = Field(default=3, ge=1)
 
-    # --- Replay / mock_live mode (consecutive-window SimpleConfirmationEngine) ---
+    # --- Replay / mock_live pacing ---
+    step_delay_seconds: float = Field(default=0.05, ge=0.0)
+
+    # These fields are accepted from inference.yaml for forward-compatibility
+    # but are not currently wired to the active ConfirmationEngine.  The
+    # running inference path uses the time-based fields above (post_fall_*,
+    # confirm_window_seconds, cooldown_seconds) for all source modes.
     confirm_n_windows: int = Field(default=3, ge=1)
     cooldown_windows: int = Field(default=10, ge=0)
-    step_delay_seconds: float = Field(default=0.05, ge=0.0)
 
     # --- ESP32 UDP transport (esp32 source_mode only) ---
     # Host/port the laptop listens on for incoming CSI UDP packets.

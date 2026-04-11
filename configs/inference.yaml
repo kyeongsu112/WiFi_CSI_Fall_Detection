@@ -10,7 +10,6 @@
 #   The two distributions are nearly disjoint; 0.50 sits in the empty gap.
 #
 #   t=0.50 replay stats: TP~897  FP~165  F1~0.899  recall~0.967
-#   confirm_n_windows=3 further suppresses isolated FP candidates.
 
 model_path: artifacts/models/wifall_baseline.pt
 candidate_threshold: 0.50
@@ -18,20 +17,26 @@ candidate_threshold: 0.50
 # source_mode selects the CSI input source used by the dashboard.
 #   replay    : read windows from the WiFall manifest + zip (default)
 #   mock_live : generate synthetic random windows (no data files needed)
-#   esp32     : future live ESP32 UDP input (not yet implemented)
+#   esp32     : live ESP32 JSON v1 UDP input
 source_mode: replay
 
-# --- Live ESP32 mode (time-based ConfirmationEngine in inference/confirmation.py) ---
-# These fields are NOT used by replay or mock_live sources.
-post_fall_inactivity_seconds: 6
-motion_floor_threshold: 0.15
-confirm_window_seconds: 8
-cooldown_seconds: 5
-# 5 s is long enough for smoke tests without flapping on Wi-Fi jitter
+# --- ConfirmationEngine parameters (used by ALL source modes) ---
+# These fields govern the time-based fall confirmation state machine
+# (inference/confirmation.py ConfirmationEngine) for replay, mock_live,
+# and esp32 sources alike.
+post_fall_inactivity_seconds: 6   # seconds of low motion required to confirm
+motion_floor_threshold: 0.15      # motion score <= this is counted as "inactive"
+confirm_window_seconds: 8         # candidate window times out after this many seconds
+cooldown_seconds: 5               # seconds to stay in cooldown before returning to idle
+# health_timeout_seconds is only relevant for live ESP32 collection health checks
 health_timeout_seconds: 5
 
-# --- Replay / mock_live mode (consecutive-window SimpleConfirmationEngine) ---
-# These fields are NOT used by the live ESP32 time-based engine.
-confirm_n_windows: 3     # consecutive candidate windows required to confirm
-cooldown_windows: 10     # windows to stay in cooldown before returning to idle
+# --- Replay pacing ---
 step_delay_seconds: 0.05 # inter-window sleep for demo pacing (seconds)
+
+# The fields below are accepted by the config schema but are NOT currently
+# wired to the active ConfirmationEngine.  The time-based fields above
+# (post_fall_inactivity_seconds, confirm_window_seconds, cooldown_seconds)
+# govern all source modes.  These are retained for forward-compatibility.
+confirm_n_windows: 3     # not consumed by the running inference path
+cooldown_windows: 10     # not consumed by the running inference path

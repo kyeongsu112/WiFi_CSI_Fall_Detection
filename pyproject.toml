@@ -10,13 +10,33 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26,<3.0",
+  "pandas>=2.0,<3.0",
   "pydantic>=2.6,<3.0",
   "PyYAML>=6.0,<7.0",
+  "fastapi>=0.111,<1.0",
+  "jinja2>=3.1,<4.0",       # required by fastapi.templating.Jinja2Templates
+  "uvicorn[standard]>=0.29,<1.0",
 ]
 
 [project.optional-dependencies]
+# torch has platform-specific wheel indexes (CPU / CUDA / ROCm) that pip
+# cannot resolve from a standard index.  Install it separately before using
+# training, inference, or the dashboard:
+#
+#   CPU-only (all platforms):
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   or simply:
+#     pip install torch
+#
+# The [ml] extra records the logical dependency for tooling / documentation
+# purposes; it will resolve correctly only when the right index is configured.
+ml = [
+  "torch>=2.0",
+  "matplotlib>=3.8",
+]
 dev = [
   "pytest>=8.0,<9.0",
+  "httpx>=0.27,<1.0",   # required by FastAPI TestClient
   "ruff>=0.3,<1.0",
 ]
 
@@ -29,6 +49,8 @@ include = [
   "collector.*",
   "preprocessing",
   "preprocessing.*",
+  "datasets",
+  "datasets.*",
   "training",
   "training.*",
   "inference",

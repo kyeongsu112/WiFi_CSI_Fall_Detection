@@ -44,9 +44,9 @@ class ReplayConfig:
     confirm_window_seconds: float = 8.0
     cooldown_seconds: float = 5.0
     window_duration_seconds: float = 1.0
-    confirm_n_windows: int = 3       # consecutive candidate windows to confirm
-    cooldown_windows: int = 10       # windows to spend in cooldown before idle
     step_delay_seconds: float = 0.05 # inter-window sleep for demo pacing
+    # confirm_n_windows / cooldown_windows were read here historically but are
+    # not wired to the active ConfirmationEngine — removed to avoid confusion.
 
 
 def load_replay_config(config_path: str | Path = "configs/inference.yaml") -> ReplayConfig:
@@ -61,8 +61,6 @@ def load_replay_config(config_path: str | Path = "configs/inference.yaml") -> Re
         confirm_window_seconds=float(raw.get("confirm_window_seconds", 8.0)),
         cooldown_seconds=float(raw.get("cooldown_seconds", 5.0)),
         window_duration_seconds=float(raw.get("window_duration_seconds", 1.0)),
-        confirm_n_windows=int(raw.get("confirm_n_windows", 3)),
-        cooldown_windows=int(raw.get("cooldown_windows", 10)),
         step_delay_seconds=float(raw.get("step_delay_seconds", 0.05)),
     )
 
@@ -104,7 +102,14 @@ class ReplayEvent:
 # ---------------------------------------------------------------------------
 
 class SimpleConfirmationEngine:
-    """Consecutive-window state machine for replay demo.
+    """Consecutive-window state machine — NOT used by the live inference pipeline.
+
+    The active server path (InferencePipeline in inference/live_source.py) and
+    replay_manifest() both use the time-based ConfirmationEngine from
+    inference/confirmation.py.  This class is retained for reference; it is
+    not instantiated anywhere in the running codebase.
+
+    Consecutive-window state machine for replay demo.
 
     Transitions:
       idle      → candidate  : prob >= threshold (first candidate window)

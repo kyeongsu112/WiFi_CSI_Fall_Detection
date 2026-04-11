@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
 
+import zipfile
+
 import numpy as np
 import torch
 
@@ -52,7 +54,38 @@ from inference.confirmation import (
     ConfirmationEngine,
     compute_motion_score,
 )
-from training.model import load_model
+from training.model import FallDetector, load_model
+
+
+# ---------------------------------------------------------------------------
+# Per-process model cache
+# ---------------------------------------------------------------------------
+#
+# Loading a FallDetector checkpoint from disk takes ~100 ms on CPU and
+# allocates a copy of all weights.  On a typical server, the model is the
+# same for every SSE connection — loading it once and sharing it across
+# InferencePipeline instances eliminates that per-connection overhead.
+#
+# Safety: FallDetector.forward() with torch.no_grad() in eval mode is
+# thread-safe on CPU.  BatchNorm in eval mode reads (never writes)
+# running_mean / running_var, so concurrent inference from different
+# worker threads is safe without any additional locking.
+
+_MODEL_CACHE: dict[str, FallDetector] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_model(model_path: str) -> FallDetector:
+    """Return a cached FallDetector, loading from disk only on first call per path.
+
+    Thread-safe: the lock is held only during the initial load; subsequent
+    callers read from the dict without blocking each other.
+    """
+    with _MODEL_CACHE_LOCK:
+        if model_path not in _MODEL_CACHE:
+            model, _ = load_model(model_path)
+            _MODEL_CACHE[model_path] = model
+        return _MODEL_CACHE[model_path]
 
 
 # ---------------------------------------------------------------------------
@@ -131,45 +164,56 @@ class ReplaySource(CsiSource):
     def windows(
         self, stop_event: threading.Event | None = None
     ) -> Generator[CsiWindow, None, None]:
-        """Yield one CsiWindow per manifest row, in manifest order."""
+        """Yield one CsiWindow per manifest row, in manifest order.
+
+        I/O efficiency: the ZIP file is opened once for the lifetime of this
+        generator, and each session CSV is parsed and cached after its first
+        access.  Subsequent windows from the same session file are served by
+        slicing the cached array — no repeated ZIP or CSV I/O.
+        """
         import pandas as pd
-        from datasets.loader import load_csi_window
+        from datasets.loader import load_csi_from_fileobj
 
         cfg = load_replay_config(self.config_path)
         delay = self.step_delay if self.step_delay is not None else cfg.step_delay_seconds
 
         manifest = pd.read_csv(self.manifest_path)
 
-        for row in manifest.itertuples(index=False):
-            if stop_event is not None and stop_event.is_set():
-                return
+        # Per-session CSI cache: source_file → full (n_rows, 52) array.
+        _csi_cache: dict[str, np.ndarray] = {}
 
-            raw = load_csi_window(
-                str(row.source_file),
-                int(row.start_row),
-                int(row.end_row),
-                self.zip_path,
-            )  # (T, 52)
+        with zipfile.ZipFile(self.zip_path) as zf:
+            for row in manifest.itertuples(index=False):
+                if stop_event is not None and stop_event.is_set():
+                    return
 
-            t = raw.shape[0]
-            if t < _WINDOW_SIZE:
-                raw = np.pad(raw, ((0, _WINDOW_SIZE - t), (0, 0)))
-            else:
-                raw = raw[:_WINDOW_SIZE]
+                source_file = str(row.source_file)
+                if source_file not in _csi_cache:
+                    with zf.open(source_file) as f:
+                        _csi_cache[source_file] = load_csi_from_fileobj(f)
 
-            # (window_size, n_subcarriers) → (n_subcarriers, window_size)
-            self._windows_emitted = int(row.window_index) + 1
-            yield CsiWindow(
-                data=raw.T.astype(np.float32),
-                source_file=str(row.source_file),
-                window_index=int(row.window_index),
-            )
+                arr = _csi_cache[source_file]
+                raw = arr[int(row.start_row):int(row.end_row)]  # (T, 52)
 
-            if delay > 0:
-                time.sleep(delay)
+                t = raw.shape[0]
+                if t < _WINDOW_SIZE:
+                    raw = np.pad(raw, ((0, _WINDOW_SIZE - t), (0, 0)))
+                else:
+                    raw = raw[:_WINDOW_SIZE]
 
-            if stop_event is not None and stop_event.is_set():
-                return
+                # (window_size, n_subcarriers) → (n_subcarriers, window_size)
+                self._windows_emitted = int(row.window_index) + 1
+                yield CsiWindow(
+                    data=raw.T.astype(np.float32),
+                    source_file=source_file,
+                    window_index=int(row.window_index),
+                )
+
+                if delay > 0:
+                    time.sleep(delay)
+
+                if stop_event is not None and stop_event.is_set():
+                    return
 
     def get_runtime_status(self) -> dict[str, object]:
         return {
@@ -580,17 +624,22 @@ class Esp32Source(CsiSource):
 class InferencePipeline:
     """Runs model inference and alert-state tracking on CsiWindow objects.
 
-    Owns the model, threshold, and SimpleConfirmationEngine.  Consumes one
+    Owns the model, threshold, and ConfirmationEngine.  Consumes one
     CsiWindow per call to step() and returns a fully-populated ReplayEvent.
 
     The model contract is unchanged from Step 2/3:
       - FallDetector returns raw logits.
       - Sigmoid is applied here, not inside the model.
+
+    The FallDetector is shared across pipeline instances via a per-process
+    cache (_get_cached_model) — it is loaded from disk only once per model
+    path, then reused by every connection.  The ConfirmationEngine is
+    per-instance (stateful per replay/live session).
     """
 
     def __init__(self, cfg: ReplayConfig) -> None:
         self.cfg = cfg
-        self._model, _ = load_model(cfg.model_path)
+        self._model = _get_cached_model(cfg.model_path)
         self._engine = ConfirmationEngine(
             ConfirmationConfig(
                 candidate_threshold=cfg.candidate_threshold,

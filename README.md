@@ -15,6 +15,10 @@ ESP32-S3 3대를 사용하는 단일 방 WiFi CSI 기반 낙상 감지 MVP입니
 
 공식 타깃은 Python 3.11+ 입니다.
 
+### 린트·테스트 전용 (torch 없음)
+
+대시보드, 학습, 추론 코드를 실행하지 않는 경우:
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -22,7 +26,28 @@ python -m pip install --upgrade pip
 python -m pip install -e .[dev]
 ```
 
-추가로 대시보드와 학습/평가를 쓰려면 현재 환경에 `fastapi`, `jinja2`, `uvicorn`, `pandas`, `torch`, `matplotlib` 가 필요합니다.
+이 경로에서 동작하는 것: `pytest`, `ruff`, `shared.*`, `collector.*`, `preprocessing.*`
+
+이 경로에서 동작하지 않는 것: `training.*`, `inference.*`, `app.server`, 대시보드, 평가 스크립트
+
+### 전체 로컬 개발 (torch 포함)
+
+학습, 추론, 대시보드까지 모두 사용하려면 `[ml]` extra를 함께 설치합니다.  
+torch는 플랫폼별 wheel index(CPU / CUDA / ROCm)를 사용하므로 별도 설치가 필요합니다:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+
+# torch 먼저 설치 (CPU-only 예시 — GPU 환경은 적절한 index-url 사용)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# 나머지 의존성 설치
+python -m pip install -e .[dev,ml]
+```
+
+이 경로에서 동작하는 것: 위 모든 것 + `training.*`, `inference.*`, `app.server`, 대시보드, 평가 스크립트
 
 ## 빠른 시작
 

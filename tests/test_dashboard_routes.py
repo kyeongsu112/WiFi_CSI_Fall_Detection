@@ -270,19 +270,30 @@ def test_blocking_put_does_not_cancel_on_success() -> None:
 # ---------------------------------------------------------------------------
 
 def test_blocking_put_terminal_delivers_on_first_attempt() -> None:
-    """Terminal event is delivered immediately when the queue has space."""
+    """Terminal event is delivered immediately when the queue has space.
+
+    Uses a plain function (not MagicMock) as the run_coroutine_threadsafe
+    stand-in so the _put_with_retry coroutine is closed immediately and no
+    'coroutine was never awaited' RuntimeWarning is emitted.
+    """
+    import concurrent.futures
     from unittest.mock import MagicMock, patch
     from app.server import _blocking_put_terminal
 
     stop_event = threading.Event()
-    mock_future = MagicMock()
-    mock_future.result.return_value = None  # succeeds first try
+    call_count = [0]
 
-    with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future) as mock_rct:
+    def _fake_rct(coro, loop):
+        call_count[0] += 1
+        coro.close()  # prevent 'coroutine never awaited' warning
+        f: concurrent.futures.Future = concurrent.futures.Future()
+        f.set_result(None)
+        return f
+
+    with patch("asyncio.run_coroutine_threadsafe", new=_fake_rct):
         _blocking_put_terminal(MagicMock(), MagicMock(), None, stop_event)
 
-    mock_rct.assert_called_once()
-    mock_future.cancel.assert_not_called()
+    assert call_count[0] == 1, "run_coroutine_threadsafe must be called exactly once"
 
 
 def test_blocking_put_terminal_schedules_single_delivery_coroutine() -> None:

@@ -327,25 +327,59 @@ def _signal_name(signum: int) -> str:
         return str(signum)
 
 
+_DEFAULT_HEALTH_TIMEOUT_SECONDS = 3.0
+
+
+def _load_health_timeout(config_dir: Path) -> float:
+    """Return health_timeout_seconds from inference.yaml, or a safe default.
+
+    inference.yaml is optional for collection — a missing, malformed, or
+    invalid config must never prevent replay or live collection from running.
+    All parsing errors are caught here so the caller never sees them.
+    """
+    try:
+        from shared.config import load_inference_config
+        return float(
+            load_inference_config(config_dir / "inference.yaml").health_timeout_seconds
+        )
+    except (FileNotFoundError, OSError):
+        pass  # file simply absent — use default silently
+    except Exception as exc:
+        # Malformed YAML, Pydantic ValidationError, or unexpected error.
+        # Warn so the operator knows the config is broken, but do not abort.
+        print(
+            f"Warning: could not read health_timeout from inference.yaml "
+            f"({type(exc).__name__}: {exc}); "
+            f"using default {_DEFAULT_HEALTH_TIMEOUT_SECONDS} s",
+            file=sys.stderr,
+        )
+    return _DEFAULT_HEALTH_TIMEOUT_SECONDS
+
+
 def main() -> int:
     from collector.session_store import SessionStore
-    from shared.config import load_all_configs
+    from shared.config import load_collection_config
 
     args = build_parser().parse_args()
     config_dir = resolve_repo_path(args.config_dir)
-    configs = load_all_configs(config_dir)
+
+    # Load only what collect needs: collection config is mandatory;
+    # inference config is optional (only health_timeout_seconds is used for
+    # live collection health checks — replay collection does not need it).
+    collection_cfg = load_collection_config(config_dir / "collection.yaml")
+    health_timeout = _load_health_timeout(config_dir)
 
     metadata_path = resolve_repo_path(args.metadata_path)
     metadata = load_session_metadata(metadata_path)
     if args.session_id:
         metadata = replace(metadata, session_id=args.session_id)
 
-    output_dir = resolve_repo_path(configs.collection.session_output_dir)
+    output_dir = resolve_repo_path(collection_cfg.session_output_dir)
     session_store = SessionStore(output_dir)
 
     try:
         packet_source = build_packet_source(
-            configs.collection,
+            collection_cfg,
             session_id=metadata.session_id,
             live_reporter=_report_live_status,
         )
@@ -357,10 +391,10 @@ def main() -> int:
         session_store=session_store,
         metadata=metadata,
         packet_source=packet_source,
-        source_type=configs.collection.source_type,
-        expected_nodes=tuple(configs.collection.expected_nodes),
-        health_timeout_seconds=float(configs.inference.health_timeout_seconds),
-        live_session_duration_seconds=configs.collection.live_session_duration_seconds,
+        source_type=collection_cfg.source_type,
+        expected_nodes=tuple(collection_cfg.expected_nodes),
+        health_timeout_seconds=health_timeout,
+        live_session_duration_seconds=collection_cfg.live_session_duration_seconds,
         reporter=_report_live_status,
     )
 

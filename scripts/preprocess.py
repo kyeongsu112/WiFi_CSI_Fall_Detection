@@ -41,20 +41,24 @@ def resolve_repo_path(path_value: str) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     from preprocessing.pipeline import process_raw_session_by_id
-    from shared.config import load_all_configs
+    from shared.config import load_collection_config, load_preprocessing_config
 
     args = build_parser().parse_args(argv)
     config_dir = resolve_repo_path(args.config_dir)
-    bundle = load_all_configs(config_dir)
 
-    raw_root = resolve_repo_path(bundle.collection.session_output_dir)
+    # Load only what preprocess needs — avoids failures due to unrelated
+    # subsystem configs (training.yaml, inference.yaml) being absent or invalid.
+    collection_cfg = load_collection_config(config_dir / "collection.yaml")
+    preprocessing_cfg = load_preprocessing_config(config_dir / "preprocessing.yaml")
+
+    raw_root = resolve_repo_path(collection_cfg.session_output_dir)
     output_root = raw_root.parent / "processed"
 
     result = process_raw_session_by_id(
         raw_root,
         session_id=args.session_id,
-        preprocessing_config=bundle.preprocessing,
-        expected_nodes=bundle.collection.expected_nodes,
+        preprocessing_config=preprocessing_cfg,
+        expected_nodes=collection_cfg.expected_nodes,
         output_root=output_root,
     )
 
